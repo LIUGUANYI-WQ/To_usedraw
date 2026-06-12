@@ -212,8 +212,14 @@ class DrawingEngine {
    * 通用绘制入口
    * @param {'circle'|'rectangle'|'square'|'triangle'|'line'|'arc'} type
    * @param {object} opts
+   * @param {string} [opts.position] - 可选位置名，如 'top-left', 'center'
    */
   drawShape(type, opts = {}) {
+    // 解析位置名 → 坐标
+    if (opts.position) {
+      const pos = this._resolvePosition(opts.position, type, opts);
+      opts = { ...opts, ...pos };
+    }
     switch (type) {
       case 'circle':    return this.drawCircle(opts);
       case 'rectangle': return this.drawRectangle(opts);
@@ -362,6 +368,73 @@ class DrawingEngine {
     }
 
     ctx.restore();
+  }
+
+  // ================================================================
+  // 位置解析
+  // ================================================================
+
+  /**
+   * 位置关键词 → 坐标映射
+   * 比例值 × 画布宽/高 = 实际像素
+   */
+  static POSITIONS = {
+    'center':       { rx: 0.5,  ry: 0.5  },
+    'top-left':     { rx: 0.15, ry: 0.15 },
+    'top-right':    { rx: 0.85, ry: 0.15 },
+    'bottom-left':  { rx: 0.15, ry: 0.85 },
+    'bottom-right': { rx: 0.85, ry: 0.85 },
+    'top':          { rx: 0.5,  ry: 0.12 },
+    'bottom':       { rx: 0.5,  ry: 0.88 },
+    'left':         { rx: 0.12, ry: 0.5  },
+    'right':        { rx: 0.88, ry: 0.5  },
+  };
+
+  /**
+   * 把位置名解析为形状参数
+   * - 中心类形状（圆、三角形、弧）→ { cx, cy }
+   * - 角基类形状（矩形、正方形）    → { x, y }
+   * - 线段                        → { x1, y1, x2, y2 }
+   */
+  _resolvePosition(name, shapeType, opts = {}) {
+    const entry = DrawingEngine.POSITIONS[name];
+    if (!entry) return {};  // 未知位置，用默认值
+
+    const px = Math.round(entry.rx * this.width);
+    const py = Math.round(entry.ry * this.height);
+
+    switch (shapeType) {
+      case 'circle':
+      case 'triangle':
+      case 'arc':
+        return { cx: px, cy: py };
+
+      case 'rectangle':
+      case 'square': {
+        // 保证形状完整在画布内
+        const w = opts.width  ?? opts.size ?? 160;
+        const h = opts.height ?? opts.size ?? 120;
+        return {
+          x: this._clampX(px - w / 2),
+          y: this._clampY(py - h / 2),
+        };
+      }
+
+      case 'line': {
+        // 根据位置决定线的方向
+        const L = 150;  // 线段半长
+        if (name === 'top' || name === 'bottom') {
+          return { x1: px - L, y1: py, x2: px + L, y2: py };
+        } else if (name === 'left' || name === 'right') {
+          return { x1: px, y1: py - L, x2: px, y2: py + L };
+        }
+        // 默认：水平线
+        return { x1: px - L, y1: py, x2: px + L, y2: py };
+      }
+
+      default:
+        return { cx: px, cy: py };
+    }
   }
 
   // ================================================================

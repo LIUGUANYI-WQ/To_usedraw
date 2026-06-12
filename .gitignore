@@ -1,0 +1,18 @@
+# API Key — 绝对不能提交
+.env
+
+# C++ 编译产物
+build/
+*.exe
+*.o
+*.obj
+
+# IDE / 系统文件
+.vs/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Node（如果有的话）
+node_modules/

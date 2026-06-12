@@ -11,17 +11,11 @@
 
 class CommandParser {
   constructor() {
-    /**
-     * 解析策略列表（按优先级从高到低）
-     * 每个策略须实现 parse(text: string) → Command | null
-     */
     this.strategies = [
-      new CanvasOpStrategy(),      // 优先级最高：清空画布
-      new SimpleDrawStrategy(),    // "画一个红色的圆"
+      new CanvasOpStrategy(),        // 清空画布
+      new PositionDrawStrategy(),    // 优先级高于 Simple："在左上角画一个红色的圆"
+      new SimpleDrawStrategy(),      // "画一个红色的圆"
     ];
-
-    // 未来只需要 push 一行：
-    // this.strategies.push(new LLMStrategy({ apiKey: '...' }));
   }
 
   /**
@@ -118,7 +112,74 @@ class CanvasOpStrategy extends BaseStrategy {
 }
 
 // ================================================================
-// 策略 2：简单绘图（形状 + 可选颜色）
+// 策略 2：位置绘图（位置 + 形状 + 可选颜色）
+// ================================================================
+class PositionDrawStrategy extends BaseStrategy {
+  constructor() {
+    super('PositionDrawStrategy');
+  }
+
+  /** 位置关键词 → 引擎内部名称 */
+  static POSITIONS = {
+    '左上角': 'top-left',    '右上角': 'top-right',
+    '左下角': 'bottom-left', '右下角': 'bottom-right',
+    '上方': 'top', '上边': 'top', '上面': 'top',
+    '下方': 'bottom', '下边': 'bottom', '下面': 'bottom',
+    '左边': 'left', '左方': 'left', '左侧': 'left',
+    '右边': 'right', '右方': 'right', '右侧': 'right',
+    '中间': 'center', '中央': 'center', '中心': 'center', '正中间': 'center',
+  };
+
+  parse(text) {
+    const posName = this._findPosition(text);
+    if (!posName) return null;  // 没有位置关键词，交给下一个策略
+
+    const foundShape = SimpleDrawStrategy._findShapeStatic(text);
+    if (!foundShape) return null;  // 没有形状关键词
+
+    const foundColor = SimpleDrawStrategy._findColorStatic(text);
+    const result = {
+      action: 'draw_shape',
+      params: {
+        shape: foundShape,
+        position: posName,
+        fillColor: foundColor ?? '#e74c3c',
+        strokeColor: '#2c3e50',
+      },
+    };
+
+    if (foundShape === 'line') {
+      result.params.strokeColor = result.params.fillColor;
+      result.params.fillColor = null;
+    }
+
+    return result;
+  }
+
+  _findPosition(text) {
+    const sorted = Object.entries(PositionDrawStrategy.POSITIONS)
+      .sort((a, b) => b[0].length - a[0].length);
+    for (const [keyword, name] of sorted) {
+      if (text.includes(keyword)) return name;
+    }
+    return null;
+  }
+
+  getPatterns() {
+    return [{
+      category: '指定位置绘图',
+      examples: [
+        '在左上角画一个圆',
+        '画一个红色的正方形在中间',
+        '在右边画一个蓝色三角形',
+        '在下面画一条黄色的线',
+      ],
+    }];
+  }
+}
+
+// ================================================================
+// 策略 3：简单绘图（形状 + 可选颜色）
 // ================================================================
 class SimpleDrawStrategy extends BaseStrategy {
   constructor() {
@@ -196,26 +257,28 @@ class SimpleDrawStrategy extends BaseStrategy {
     return result;
   }
 
-  _findColor(text) {
-    // 按最长匹配优先排序（避免"红色"中的"红"先匹配到）
+  /** 静态版颜色查找，供其他策略复用 */
+  static _findColorStatic(text) {
     const sorted = Object.entries(SimpleDrawStrategy.COLORS)
       .sort((a, b) => b[0].length - a[0].length);
-
     for (const [keyword, hex] of sorted) {
       if (text.includes(keyword)) return hex;
     }
     return null;
   }
 
-  _findShape(text) {
+  /** 静态版形状查找，供其他策略复用 */
+  static _findShapeStatic(text) {
     const sorted = Object.entries(SimpleDrawStrategy.SHAPES)
       .sort((a, b) => b[0].length - a[0].length);
-
     for (const [keyword, type] of sorted) {
       if (text.includes(keyword)) return type;
     }
     return null;
   }
+
+  _findColor(text) { return SimpleDrawStrategy._findColorStatic(text); }
+  _findShape(text) { return SimpleDrawStrategy._findShapeStatic(text); }
 
   getPatterns() {
     return [
