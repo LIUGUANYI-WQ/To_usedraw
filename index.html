@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🎤 语音绘图工具</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+  <div class="app-container">
+    <!-- 顶部标题栏 -->
+    <header class="app-header">
+      <h1 class="app-title">🎤 语音绘图工具</h1>
+      <span class="header-hint">纯语音控制，无需鼠标键盘</span>
+    </header>
+
+    <!-- 画布区域 -->
+    <main class="canvas-area">
+      <canvas
+        id="drawCanvas"
+        width="800"
+        height="500"
+        aria-label="绘图画布"
+        role="img"
+      ></canvas>
+      <p class="canvas-placeholder" id="canvasPlaceholder">
+        👆 画布已就绪，说出指令开始绘图
+      </p>
+    </main>
+
+    <!-- 控制栏 -->
+    <section class="control-bar">
+      <button id="micBtn" class="mic-btn mic-btn--idle" title="开始/停止监听">
+        <span class="mic-icon">🎤</span>
+        <span class="mic-label" id="micLabel">开始监听</span>
+      </button>
+
+      <div class="status-indicator" id="statusIndicator">
+        <span class="status-dot status-dot--idle" id="statusDot"></span>
+        <span class="status-text" id="statusText">等待中</span>
+      </div>
+    </section>
+
+    <!-- 识别结果展示 -->
+    <section class="transcript-area">
+      <div class="transcript-header">识别结果</div>
+      <div class="transcript-content" id="transcriptContent">
+        <span class="transcript-placeholder">语音识别内容将实时显示在这里...</span>
+      </div>
+      <div class="confidence-bar" id="confidenceBar" hidden>
+        <div class="confidence-fill" id="confidenceFill"></div>
+      </div>
+    </section>
+
+    <!-- 错误/不支持提示 -->
+    <section class="error-area" id="errorArea" hidden>
+      <p class="error-message" id="errorMessage"></p>
+    </section>
+  </div>
+
+  <script src="js/main.js"></script>
+</body>
+</html>
