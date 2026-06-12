@@ -1,0 +1,259 @@
+/* ===========================================
+   语音绘图工具 — 基础样式（第1个PR：脚手架）
+   =========================================== */
+
+/* --- CSS 变量 --- */
+:root {
+  --color-bg: #1e1e2e;
+  --color-surface: #2a2a3e;
+  --color-border: #3a3a52;
+  --color-text: #e0e0f0;
+  --color-text-muted: #8888a0;
+  --color-accent: #7c8cf8;
+  --color-accent-glow: #a0b0ff;
+  --color-success: #4ade80;
+  --color-warning: #facc15;
+  --color-danger: #f87171;
+  --color-canvas-bg: #ffffff;
+  --radius: 8px;
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+}
+
+/* --- 全局重置 --- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--color-bg);
+  color: var(--color-text);
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 16px;
+}
+
+/* --- 主容器 --- */
+.app-container {
+  width: 100%;
+  max-width: 880px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* --- 顶部标题栏 --- */
+.app-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.app-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.header-hint {
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+}
+
+/* --- 画布区域 --- */
+.canvas-area {
+  position: relative;
+  background: var(--color-surface);
+  border: 2px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 12px;
+}
+
+#drawCanvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  background: var(--color-canvas-bg);
+  border-radius: 2px;
+  box-shadow: var(--shadow);
+}
+
+.canvas-placeholder {
+  position: absolute;
+  bottom: 20px;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  pointer-events: none;
+}
+
+/* --- 控制栏 --- */
+.control-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+/* --- 麦克风按钮 --- */
+.mic-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 22px;
+  border: 2px solid var(--color-border);
+  border-radius: 50px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 1rem;
+  cursor: pointer;
+  transition: all 0.25s ease;
+  user-select: none;
+}
+
+.mic-btn:hover {
+  border-color: var(--color-accent);
+  background: rgba(124, 140, 248, 0.08);
+}
+
+.mic-btn--idle {
+  border-color: var(--color-border);
+}
+
+.mic-btn--listening {
+  border-color: var(--color-success);
+  background: rgba(74, 222, 128, 0.08);
+  animation: mic-pulse 2s infinite;
+}
+
+.mic-btn--error {
+  border-color: var(--color-danger);
+  background: rgba(248, 113, 113, 0.08);
+}
+
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.4); }
+  50%      { box-shadow: 0 0 0 8px rgba(74, 222, 128, 0); }
+}
+
+.mic-icon {
+  font-size: 1.3rem;
+}
+
+/* --- 状态指示器 --- */
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  transition: background 0.3s;
+}
+
+.status-dot--idle       { background: #666; }
+.status-dot--listening  { background: var(--color-success); animation: dot-pulse 1s infinite; }
+.status-dot--error      { background: var(--color-danger); }
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(0.7); }
+}
+
+.status-text {
+  font-size: 0.9rem;
+  color: var(--color-text-muted);
+}
+
+/* --- 识别结果 --- */
+.transcript-area {
+  padding: 12px 16px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.transcript-header {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-muted);
+  margin-bottom: 6px;
+}
+
+.transcript-content {
+  min-height: 28px;
+  font-size: 1.05rem;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.transcript-interim {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.transcript-final {
+  color: var(--color-text);
+  font-weight: 500;
+}
+
+.transcript-placeholder {
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+}
+
+/* --- 置信度条 --- */
+.confidence-bar {
+  height: 3px;
+  background: var(--color-border);
+  border-radius: 2px;
+  margin-top: 8px;
+  overflow: hidden;
+}
+
+.confidence-fill {
+  height: 100%;
+  background: var(--color-accent);
+  border-radius: 2px;
+  transition: width 0.2s ease;
+}
+
+/* --- 错误提示 --- */
+.error-area {
+  padding: 10px 16px;
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius);
+}
+
+.error-message {
+  font-size: 0.9rem;
+  color: var(--color-danger);
+  margin: 0;
+}
+
+/* --- 响应式 --- */
+@media (max-width: 600px) {
+  body { padding: 8px; }
+  .app-title { font-size: 1.2rem; }
+  .control-bar { flex-direction: column; align-items: stretch; }
+  .mic-btn { justify-content: center; }
+  .status-indicator { justify-content: center; }
+}
