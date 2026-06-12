@@ -1,6 +1,6 @@
 /**
  * 语音绘图工具 — 主入口
- * PR 2.1: 集成 DrawingEngine，语音识别仍只打印结果
+ * PR 2.2: 集成 CommandParser，打通中文语音 → 绘图闭环
  */
 
 (function () {
@@ -24,8 +24,18 @@
   // ===========================
   // DrawingEngine
   // ===========================
+  let isListening = false;
+  let recognition = null;
+  let restartDelayId = null;      // onend 延迟重启定时器
+  let consecutiveRestarts = 0;    // 连续重启计数
+  const MAX_RESTARTS = 5;         // 连续重启上限
+  const RESTART_DELAY = 300;      // 重启延迟（毫秒）
+
   /** @type {DrawingEngine} */
   let engine = null;
+
+  /** @type {CommandParser} */
+  let parser = null;
 
   function initCanvas() {
     if (!canvas) {
@@ -33,8 +43,10 @@
       return false;
     }
     engine = new DrawingEngine(canvas);
+    parser = new CommandParser();
     window.engine = engine;   // 暴露到全局，方便控制台测试
-    console.log('✅ DrawingEngine 初始化完成');
+    window.parser = parser;
+    console.log('✅ DrawingEngine + CommandParser 初始化完成');
     return true;
   }
 
@@ -56,6 +68,49 @@
   };
 
   // ===========================
+  // ===========================
+  // 指令执行 & 反馈
+  // ===========================
+
+  /**
+   * 执行解析后的绘图指令
+   * @param {object} cmd - CommandParser 返回的命令对象
+   * @param {string} rawText - 原始语音文本
+   * @param {number} confidence - 识别置信度
+   */
+  function executeCommand(cmd, rawText, confidence) {
+    console.log('[指令]', cmd.action, cmd.params);
+    console.log('  命中策略:', cmd.matchedStrategy);
+    console.log('  识别文本: "' + rawText + '"');
+    console.log('  置信度:', (confidence * 100).toFixed(0) + '%');
+
+    switch (cmd.action) {
+      case 'draw_shape':
+        engine.drawShape(cmd.params.shape, cmd.params);
+        canvasPlaceholder.textContent = '已绘制: ' + rawText;
+        break;
+
+      case 'clear_canvas':
+        engine.clear();
+        canvasPlaceholder.textContent = '画布已清空';
+        break;
+
+      default:
+        console.warn('未知指令类型:', cmd.action);
+        canvasPlaceholder.textContent = '未识别的指令: "' + rawText + '"';
+        return;
+    }
+  }
+
+  /**
+   * 无法识别时的反馈
+   */
+  function showUnrecognized(text, confidence) {
+    console.log('[未识别] "' + text + '" (置信度: ' + (confidence * 100).toFixed(0) + '%)');
+    console.log('  试试说: "画一个圆"、"画一个红色的正方形"、"清空画布"');
+    canvasPlaceholder.textContent = '未识别: "' + text + '" — 试试说"画一个圆"';
+  }
+
   // Web Speech API
   // ===========================
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -74,6 +129,16 @@
   }
 
   function createRecognition() {
+    const rec = _createRawRecognition();
+    recognition = rec;
+    return rec;
+  }
+
+  /**
+   * 创建原始 SpeechRecognition 实例（不替换全局 recognition）
+   * 供 createRecognition 和 onend 自动重启使用
+   */
+  function _createRawRecognition() {
     const rec = new SpeechRecognition();
     rec.continuous = true;
     rec.interimResults = true;
@@ -100,9 +165,13 @@
 
       if (final) {
         showFinal(final.trim(), confidence);
-        // TODO PR 2.2: 这里接入 CommandParser，把语音转成绘图指令
-        console.log('[识别结果] (置信度: ' + (confidence * 100).toFixed(0) + '%):', final.trim());
-        console.log('  (PR 2.2 将在此处接入 CommandParser → DrawingEngine)');
+        // 接入 CommandParser → DrawingEngine
+        const cmd = parser.parse(final.trim());
+        if (cmd) {
+          executeCommand(cmd, final.trim(), confidence);
+        } else {
+          showUnrecognized(final.trim(), confidence);
+        }
       }
     };
 
@@ -136,17 +205,41 @@
     };
 
     rec.onend = function () {
-      console.log('语音识别已结束');
-      if (isListening) {
-        console.log('自动重启语音识别...');
-        try { rec.start(); } catch (e) {
+      console.log('语音识别会话结束');
+      if (!isListening) {
+        setListeningState(false);
+        return;
+      }
+
+      // 连续重启超出上限 → 放弃，提示用户手动重试
+      if (consecutiveRestarts >= MAX_RESTARTS) {
+        console.error('连续重启超过 ' + MAX_RESTARTS + ' 次，停止自动恢复');
+        stopListening(true);
+        showError('语音识别频繁中断，请检查网络后重新点击开始');
+        return;
+      }
+
+      // 延迟重启，避免和浏览器内部状态冲突
+      consecutiveRestarts++;
+      console.log('将在 ' + RESTART_DELAY + 'ms 后自动重启（第 ' + consecutiveRestarts + ' 次）...');
+      restartDelayId = setTimeout(() => {
+        restartDelayId = null;
+        if (!isListening) return;
+
+        // 重建 recognition 实例（旧实例可能处于 broken 状态）
+        try { rec.abort(); } catch (_) {}
+        const freshRec = _createRawRecognition();
+        recognition = freshRec;
+
+        try {
+          freshRec.start();
+          console.log('语音识别已自动重启');
+        } catch (e) {
           console.error('重启失败:', e);
           stopListening(true);
           showError('语音识别意外中断，请点击按钮重新开始');
         }
-      } else {
-        setListeningState(false);
-      }
+      }, RESTART_DELAY);
     };
 
     return rec;
@@ -155,6 +248,7 @@
   function startListening() {
     if (!recognition) recognition = createRecognition();
     isListening = true;
+    consecutiveRestarts = 0;   // 重置重启计数
     hideError();
     try {
       recognition.start();
@@ -173,8 +267,16 @@
 
   function stopListening(errorOccurred = false) {
     isListening = false;
+    consecutiveRestarts = 0;  // 重置计数器
+
+    // 清除延迟重启定时器
+    if (restartDelayId) {
+      clearTimeout(restartDelayId);
+      restartDelayId = null;
+    }
+
     if (recognition) {
-      try { recognition.stop(); } catch (_) {}
+      try { recognition.abort(); } catch (_) {}
     }
     if (!errorOccurred) setListeningState(false);
   }
@@ -265,8 +367,11 @@
     }
 
     console.log('画布尺寸:', canvas.width + '×' + canvas.height);
+    console.log('支持指令:', parser.getSupportedCommands()
+      .map(c => c.examples.join(', ')).join('\n          '));
     console.log('💡 点击"开始监听"后对麦克风说中文');
-    console.log('💡 在控制台执行 drawTest() 测试画布绘图');
+    console.log('💡 试试说: "画一个圆"、"画一个红色正方形"、"清空画布"');
+    console.log('💡 控制台: drawTest() 手动绘图 / parser.parse("画一个圆") 测试解析');
   }
 
   if (document.readyState === 'loading') {
