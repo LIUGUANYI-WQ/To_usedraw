@@ -220,18 +220,37 @@
             canvasPlaceholder.textContent = 'AI: ' + (parseResult.correctedText || txt);
             showParsedResult(parseResult);
 
-            // 生成图片
+            // 生成图片 — 加载动画 + 计时器
+            const overlay = document.getElementById('loadingOverlay');
+            const timerEl = document.getElementById('loadingTimer');
+            const loadText = document.getElementById('loadingText');
+            let elapsed = 0;
+            const startTime = Date.now();
+            const timerId = setInterval(() => {
+              elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+              if (timerEl) timerEl.textContent = '已等待 ' + elapsed + ' 秒';
+              if (loadText && elapsed > 5) loadText.textContent = '还在生成中，请耐心等候...';
+            }, 200);
+
+            if (overlay) overlay.style.display = 'flex';
             statusText.textContent = 'AI 生成图片中...';
-            canvasPlaceholder.textContent = '生成中... 请稍候';
+            canvasPlaceholder.textContent = '生成中...';
+
             return llmSvc.generate(parseResult.englishPrompt).then(genResult => {
+              clearInterval(timerId);
+              if (overlay) overlay.style.display = 'none';
               hideLLMThinking();
               if (genResult && (genResult.imageUrl || genResult.localPath)) {
                 const imgUrl = genResult.localPath || genResult.imageUrl;
                 engine.displayImage(imgUrl);
-                canvasPlaceholder.textContent = '✅ ' + (parseResult.correctedText || txt);
+                canvasPlaceholder.textContent = '✅ ' + (parseResult.correctedText || txt) + ' （耗时 ' + elapsed + 's）';
               } else {
                 canvasPlaceholder.textContent = '生成失败，请重试';
               }
+            }).catch(err => {
+              clearInterval(timerId);
+              if (overlay) overlay.style.display = 'none';
+              throw err;
             });
           }).catch(e => {
             hideLLMThinking();
