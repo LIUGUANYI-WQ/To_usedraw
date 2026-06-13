@@ -237,9 +237,30 @@ class DrawingEngine {
    * 清空画布
    */
   clear() {
-    if (this.objects.length === 0) return;  // 已经是空的
+    if (this.objects.length === 0) return;
     this.objects = [];
     this._render();
+  }
+
+  /**
+   * 展示 AI 生成图片
+   * @param {string} url - 图片 URL
+   */
+  displayImage(url) {
+    const img = document.getElementById('aiImage');
+    if (!img) return;
+    img.src = url;
+    img.style.display = 'block';
+    this.canvas.style.display = 'none';   // 隐藏旧 Canvas
+  }
+
+  /**
+   * 切换回画布
+   */
+  showCanvas() {
+    const img = document.getElementById('aiImage');
+    if (img) img.style.display = 'none';
+    this.canvas.style.display = 'block';
   }
 
   /**

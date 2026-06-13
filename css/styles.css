@@ -88,6 +88,16 @@ body {
   box-shadow: var(--shadow);
 }
 
+/* --- AI 生成图片 --- */
+.ai-image {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  object-fit: contain;
+}
+
 .canvas-placeholder {
   position: absolute;
   bottom: 20px;
@@ -247,6 +257,30 @@ body {
   font-size: 0.9rem;
   color: var(--color-danger);
   margin: 0;
+}
+
+/* --- AI Prompt 预览 --- */
+.prompt-preview {
+  margin-top: 6px;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+.prompt-label {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+.prompt-text {
+  color: var(--color-text);
+}
+
+.prompt-meta {
+  margin-top: 4px;
+  font-size: 0.78rem;
+  color: var(--color-text-muted);
+  opacity: 0.8;
 }
 
 /* --- 响应式 --- */

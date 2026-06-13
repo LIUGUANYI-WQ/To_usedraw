@@ -24,8 +24,9 @@
         aria-label="绘图画布"
         role="img"
       ></canvas>
+      <img id="aiImage" class="ai-image" alt="AI 生成图片" style="display:none">
       <p class="canvas-placeholder" id="canvasPlaceholder">
-        👆 画布已就绪，说出指令开始绘图
+        🎤 说出你想要的画面，AI 帮你画出来
       </p>
     </main>
 
@@ -61,6 +62,7 @@
 
   <script src="js/drawing-engine.js"></script>
   <script src="js/command-parser.js"></script>
+  <script src="js/llm-service.js"></script>
   <script src="js/main.js"></script>
 </body>
 </html>

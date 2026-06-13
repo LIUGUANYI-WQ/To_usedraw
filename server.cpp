@@ -1,141 +1,304 @@
 /**
- * server.cpp — 语音绘图工具 C++ 后端
- * PR 3.1: HTTP 服务骨架 + 静态文件 + /api/health
+ * server.cpp — AI 语音绘图 C++ 后端
+ * PR 3.2: /api/parse → DeepSeek 理解中文 → 优化英文 Prompt
  *
- * 依赖（header-only）:
- *   - cpp-httplib:  https://github.com/yhirose/cpp-httplib
- *   - nlohmann/json: https://github.com/nlohmann/json
+ * WSL 编译:  cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j$(nproc)
+ * 运行:      ./build/server
  *
- * 编译 & 运行:
- *   cmake -B build -G "Visual Studio 17 2022"
- *   cmake --build build --config Debug
- *   build\Debug\server.exe
- *
- * API Key 配置:
- *   复制 .env.example 为 .env，填入 Key 即可，无需手动设环境变量
+ * 依赖: cpp-httplib + nlohmann/json + OpenSSL（libssl-dev）
  */
 
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"
+#include "nlohmann/json.hpp"
+
+#include <cctype>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <filesystem>
 
-// header-only 库
-#include "httplib.h"
-#include "nlohmann/json.hpp"
-
 using json = nlohmann::json;
-
 namespace fs = std::filesystem;
 
-// ============================================================
-// 从 .env 文件加载环境变量
-// ============================================================
-static void loadEnvFile(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) return;
+// ===== API Keys =====
+static std::string g_deepseekKey;
+static std::string g_zhipuKey;
+static std::string g_dashscopeKey;
 
+static void initApiKeys() {
+    std::ifstream f(".env");
+    if (!f) return;
     std::string line;
-    while (std::getline(file, line)) {
-        // 跳过空行和注释
+    while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
-
-        // 去掉首尾空格
-        auto start = line.find_first_not_of(" \t\r");
-        auto end   = line.find_last_not_of(" \t\r");
-        if (start == std::string::npos) continue;
-        line = line.substr(start, end - start + 1);
-
-        // 分离 KEY=VALUE
+        auto s = line.find_first_not_of(" \t\r");
+        auto e = line.find_last_not_of(" \t\r");
+        if (s == std::string::npos) continue;
+        line = line.substr(s, e - s + 1);
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
-
-        std::string key   = line.substr(0, eq);
-        std::string value = line.substr(eq + 1);
-
-        // 去掉 value 两端的引号
-        if (value.size() >= 2 &&
-            ((value.front() == '"'  && value.back() == '"') ||
-             (value.front() == '\'' && value.back() == '\'')))
-        {
-            value = value.substr(1, value.size() - 2);
-        }
-
-        // 只在环境变量未设置时才覆盖（方便命令行临时覆盖）
-#ifdef _WIN32
-        _putenv_s(key.c_str(), value.c_str());
-#else
-        setenv(key.c_str(), value.c_str(), 0);
-#endif
+        std::string k = line.substr(0, eq);
+        std::string v = line.substr(eq + 1);
+        if (!v.empty() && v.front() == '"' && v.back() == '"')
+            v = v.substr(1, v.size() - 2);
+        if (k == "DEEPSEEK_API_KEY")   g_deepseekKey = v;
+        if (k == "ZHIPU_API_KEY")      g_zhipuKey = v;
+        if (k == "DASHSCOPE_API_KEY")  g_dashscopeKey = v;
     }
 }
 
-// ============================================================
-// 获取 API Key
-// ============================================================
-static std::string getApiKey() {
-    const char* key = std::getenv("DEEPSEEK_API_KEY");
-    if (!key) {
-        std::cerr << "[WARN] DEEPSEEK_API_KEY 未设置" << std::endl;
-        std::cerr << "       请复制 .env.example 为 .env 并填入 Key" << std::endl;
-        return "";
+// ===== DeepSeek HTTPS (httplib + OpenSSL) =====
+static bool callDeepSeek(const std::string& systemPrompt,
+                         const std::string& userText,
+                         std::string& outResponse) {
+    json body;
+    body["model"] = "deepseek-chat";
+    body["temperature"] = 0.3;
+    body["messages"] = json::array({
+        {{"role","system"}, {"content",systemPrompt}},
+        {{"role","user"},   {"content",userText}}
+    });
+
+    httplib::Client cli("https://api.deepseek.com");
+    cli.set_read_timeout(30);
+    cli.set_write_timeout(30);
+    cli.enable_server_certificate_verification(true);
+
+    auto res = cli.Post("/v1/chat/completions",
+        {{"Content-Type", "application/json"},
+         {"Authorization", "Bearer " + g_deepseekKey}},
+        body.dump(), "application/json");
+
+    if (!res || res->status != 200) {
+        std::cerr << "[ERROR] DeepSeek: " << (res ? std::to_string(res->status) : "no response") << std::endl;
+        if (res) std::cerr << "  body: " << res->body.substr(0, 300) << std::endl;
+        return false;
     }
-    return std::string(key);
+
+    outResponse = res->body;
+    return true;
 }
 
-// ================================================================
-// main
-// ================================================================
+// ===== System Prompt =====
+static const char* PARSE_SYSTEM_PROMPT =
+    "You are an AI drawing assistant. The user describes a scene in Chinese via voice, "
+    "which may contain speech recognition errors (homophones, typos).\n\n"
+    "Your tasks:\n"
+    "1. Correct any Chinese speech recognition errors\n"
+    "2. Understand what scene, style, and mood the user wants\n"
+    "3. Convert the corrected description into an optimized English "
+    "Stable Diffusion prompt (comma-separated keywords)\n\n"
+    "## Prompt rules\n"
+    "- Format: subject, scene, details, style, lighting, quality\n"
+    "- Always append: masterpiece, best quality\n"
+    "- Default style: digital illustration, vibrant colors\n"
+    "- Infer reasonable details if vague\n"
+    "- Never add NSFW content\n\n"
+    "## Return strict JSON only, no markdown\n"
+    "{\n"
+    "  \"correctedText\": \"corrected Chinese\",\n"
+    "  \"englishPrompt\": \"optimized SD prompt\",\n"
+    "  \"style\": \"inferred style\",\n"
+    "  \"analysis\": \"one-sentence summary\"\n"
+    "}";
+
+// ===== main =====
 int main() {
-    // 自动加载 .env 文件（从可执行文件所在目录或当前工作目录）
-    if (fs::exists(".env")) {
-        loadEnvFile(".env");
-        std::cout << "[INFO] 已加载 .env 配置" << std::endl;
-    }
+    initApiKeys();
+    std::cout << "[INFO] DeepSeek: " << (g_deepseekKey.empty() ? "NOT FOUND" : "loaded")
+              << "  DashScope: " << (g_dashscopeKey.empty() ? "NOT FOUND" : "loaded") << std::endl;
+    if (g_deepseekKey.empty())  std::cerr << "Set DEEPSEEK_API_KEY in .env" << std::endl;
+    if (g_dashscopeKey.empty()) std::cerr << "Set DASHSCOPE_API_KEY in .env" << std::endl;
+
+    // 创建 generated 目录（图片输出）
+    fs::create_directory("generated");
 
     httplib::Server svr;
-
     const int port = 8080;
 
-    // --------------------------------------------------
-    // 1. 静态文件服务（前端页面）
-    // --------------------------------------------------
     svr.set_mount_point("/", ".");
 
-    // --------------------------------------------------
-    // 2. 健康检查
-    // --------------------------------------------------
     svr.Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
-        json body;
-        body["status"] = "ok";
-        body["service"] = "voice-drawing-backend";
-        body["version"] = "0.1.0";
-        res.set_content(body.dump(2), "application/json");
+        json b;
+        b["status"] = "ok"; b["version"] = "0.3.0";
+        res.set_content(b.dump(), "application/json");
     });
 
-    // --------------------------------------------------
-    // 3. LLM 代理（占位，PR 3.2 实现）
-    // --------------------------------------------------
+    // ---- POST /api/parse -------------------------------------------------
     svr.Post("/api/parse", [](const httplib::Request& req, httplib::Response& res) {
-        (void)req;
-        json body;
-        body["error"] = "not implemented yet";
-        body["message"] = "/api/parse will be implemented in PR 3.2";
-        res.status = 501;
-        res.set_content(body.dump(2), "application/json");
+        json reqBody;
+        try { reqBody = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid JSON\"}", "application/json");
+            return;
+        }
+
+        std::string text = reqBody.value("text", "");
+        if (text.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing text\"}", "application/json");
+            return;
+        }
+
+        if (g_deepseekKey.empty()) {
+            res.status = 500;
+            res.set_content("{\"error\":\"API key not set\"}", "application/json");
+            return;
+        }
+
+        std::string raw;
+        if (!callDeepSeek(PARSE_SYSTEM_PROMPT, text, raw) || raw.empty()) {
+            res.status = 502;
+            res.set_content("{\"error\":\"DeepSeek API failed\"}", "application/json");
+            return;
+        }
+
+        // Parse response
+        json apiResp;
+        try { apiResp = json::parse(raw); } catch (...) {
+            res.status = 502;
+            res.set_content("{\"error\":\"invalid API response\"}", "application/json");
+            return;
+        }
+
+        std::string content = apiResp["choices"][0]["message"]["content"];
+
+        // Strip markdown
+        {
+            auto p = content.find("```json");
+            if (p != std::string::npos) content = content.substr(p + 7);
+            else { p = content.find("```"); if (p != std::string::npos) content = content.substr(p + 3); }
+            p = content.rfind("```");
+            if (p != std::string::npos) content = content.substr(0, p);
+            auto a = content.find_first_not_of(" \t\n\r");
+            auto b = content.find_last_not_of(" \t\n\r");
+            if (a != std::string::npos) content = content.substr(a, b - a + 1);
+        }
+
+        json parsed;
+        try { parsed = json::parse(content); } catch (...) {
+            res.status = 502;
+            json err;
+            err["error"] = "LLM output not valid JSON";
+            err["raw"] = content;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        res.set_content(parsed.dump(), "application/json");
+        std::cout << "[PARSE] \"" << text.substr(0, 40) << "\" -> "
+                  << parsed.value("englishPrompt", "?").substr(0, 60) << "..." << std::endl;
     });
 
-    // --------------------------------------------------
-    // 启动
-    // --------------------------------------------------
-    std::cout << "========================================" << std::endl;
-    std::cout << "   " << std::endl;
-    std::cout << "  port: " << port << std::endl;
-    std::cout << "  addr: http://localhost:" << port << std::endl;
-    std::cout << "========================================" << std::endl;
+    // ---- POST /api/generate (DashScope Z-Image-Turbo) --------------------
+    svr.Post("/api/generate", [](const httplib::Request& req, httplib::Response& res) {
+        json reqBody;
+        try { reqBody = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid JSON\"}", "application/json");
+            return;
+        }
+        std::string prompt = reqBody.value("prompt", "");
+        if (prompt.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing prompt\"}", "application/json");
+            return;
+        }
+        if (g_dashscopeKey.empty()) {
+            res.status = 500;
+            res.set_content("{\"error\":\"DASHSCOPE_API_KEY not set\"}", "application/json");
+            return;
+        }
 
+        // DashScope Z-Image-Turbo 原生异步 API
+        json dashBody;
+        dashBody["model"] = "zimage-turbo";
+        dashBody["input"]["prompt"] = prompt;
+        dashBody["parameters"]["size"] = "1024*1024";
+        dashBody["parameters"]["n"] = 1;
+
+        // 1. 提交生成任务
+        std::ofstream("_gen_req.json") << dashBody.dump();
+        std::string submitCmd =
+            "curl -s --max-time 30 "
+            "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis "
+            "-H \"Content-Type: application/json\" "
+            "-H \"X-DashScope-Async: enable\" "
+            "-H \"Authorization: Bearer " + g_dashscopeKey + "\" "
+            "-d @_gen_req.json > _gen_resp.json 2>&1";
+        system(submitCmd.c_str());
+
+        std::ifstream respFile("_gen_resp.json");
+        std::string raw((std::istreambuf_iterator<char>(respFile)),
+                         std::istreambuf_iterator<char>());
+        respFile.close();
+        fs::remove("_gen_req.json");
+        fs::remove("_gen_resp.json");
+
+        json submitResp;
+        try { submitResp = json::parse(raw); } catch (...) {
+            res.status = 502;
+            json err; err["error"] = "invalid response"; err["raw"] = raw.substr(0, 300);
+            res.set_content(err.dump(), "application/json");
+            std::cerr << "[GENERATE SUBMIT] parse failed: " << raw.substr(0, 300) << std::endl; return;
+        }
+        if (submitResp.contains("code") && !submitResp["code"].is_null()) {
+            std::string msg = submitResp.value("message", "");
+            res.status = 502;
+            json err; err["error"] = msg; err["raw"] = raw.substr(0, 400);
+            res.set_content(err.dump(), "application/json");
+            std::cerr << "[GENERATE SUBMIT] " << raw.substr(0, 400) << std::endl; return;
+        }
+
+        std::string taskId = submitResp["output"]["task_id"];
+
+        // 2. 轮询直到完成
+        std::string imageUrl;
+        for (int i = 0; i < 20; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::string pollCmd =
+                "curl -s "
+                "https://dashscope.aliyuncs.com/api/v1/tasks/" + taskId +
+                " -H \"Authorization: Bearer " + g_dashscopeKey + "\" > _gen_resp.json 2>&1";
+            system(pollCmd.c_str());
+
+            std::ifstream pf("_gen_resp.json");
+            std::string pRaw((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
+            pf.close();
+            json pResp = json::parse(pRaw);
+            std::string status = pResp["output"].value("task_status", "");
+            if (status == "SUCCEEDED") {
+                imageUrl = pResp["output"]["results"][0].value("url", "");
+                break;
+            } else if (status == "FAILED") {
+                res.status = 502; res.set_content("{\"error\":\"generation failed\"}", "application/json"); return;
+            }
+        }
+
+        if (imageUrl.empty()) {
+            res.status = 502; res.set_content("{\"error\":\"timeout\"}", "application/json"); return;
+        }
+
+        // 3. 下载图片
+        static int imgIdx = 0; imgIdx++;
+        std::string localPath = "generated/img_" + std::to_string(imgIdx) + ".png";
+        std::string dlCmd = "curl -s --max-time 30 \"" + imageUrl + "\" -o " + localPath + " 2>&1";
+        system(dlCmd.c_str());
+
+        json out;
+        out["imageUrl"]  = imageUrl;
+        out["localPath"] = "/" + localPath;
+        out["prompt"]    = prompt;
+        res.set_content(out.dump(), "application/json");
+        std::cout << "[GENERATE] " << localPath << std::endl;
+    });
+
+    std::cout << "=== AI Voice Drawing Backend :" << port << " ===" << std::endl;
     svr.listen("0.0.0.0", port);
-
     return 0;
 }
