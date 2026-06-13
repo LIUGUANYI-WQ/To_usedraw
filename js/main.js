@@ -206,22 +206,37 @@
           return;
         }
 
-        // 策略2: LLM 兜底（调后端 /api/parse → DeepSeek）
+        // 策略2: LLM 全链路 — parse → generate → 展示图片
         if (llmSvc) {
           showLLMThinking();
-          llmSvc.parse(txt).then(result => {
-            hideLLMThinking();
-            if (result && result.englishPrompt) {
-              console.log('AI 理解:', result);
-              canvasPlaceholder.textContent = 'AI: ' + (result.correctedText || txt);
-              showParsedResult(result);
-            } else {
+          statusText.textContent = 'AI 理解中...';
+          llmSvc.parse(txt).then(parseResult => {
+            if (!parseResult || !parseResult.englishPrompt) {
+              hideLLMThinking();
               showUnrecognized(txt, confidence);
+              return;
             }
+            console.log('AI 理解:', parseResult);
+            canvasPlaceholder.textContent = 'AI: ' + (parseResult.correctedText || txt);
+            showParsedResult(parseResult);
+
+            // 生成图片
+            statusText.textContent = 'AI 生成图片中...';
+            canvasPlaceholder.textContent = '生成中... 请稍候';
+            return llmSvc.generate(parseResult.englishPrompt).then(genResult => {
+              hideLLMThinking();
+              if (genResult && (genResult.imageUrl || genResult.localPath)) {
+                const imgUrl = genResult.localPath || genResult.imageUrl;
+                engine.displayImage(imgUrl);
+                canvasPlaceholder.textContent = '✅ ' + (parseResult.correctedText || txt);
+              } else {
+                canvasPlaceholder.textContent = '生成失败，请重试';
+              }
+            });
           }).catch(e => {
             hideLLMThinking();
-            console.error('LLM 解析失败:', e);
-            showUnrecognized(txt, confidence);
+            console.error('AI 链路失败:', e);
+            canvasPlaceholder.textContent = '错误: ' + e.message;
           });
         } else {
           showUnrecognized(txt, confidence);

@@ -1,51 +1,60 @@
 /**
- * LLMService — 前端 LLM 调用封装
- * PR 3.2: 调用后端 /api/parse，后端代理 DeepSeek
+ * LLMService — 前端 API 调用封装
+ * PR 3.3: /api/parse (DeepSeek) + /api/generate (通义万相)
  */
 
 class LLMService {
   constructor(serverUrl = '') {
-    this.serverUrl = serverUrl || '';  // 空 = 同源
+    this.serverUrl = serverUrl || '';
   }
 
   /**
-   * 调用后端 LLM 解析接口
-   * @param {string} text - 语音识别文本
-   * @returns {Promise<{correctedText: string, englishPrompt: string, style: string, analysis: string}>}
+   * 语音文字 → DeepSeek 理解 → 优化 Prompt
    */
   async parse(text) {
     const resp = await fetch(this.serverUrl + '/api/parse', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text }),
+      body: JSON.stringify({ text }),
     });
-
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'LLM 服务请求失败 (HTTP ' + resp.status + ')');
+      throw new Error(err.error || '/api/parse failed (HTTP ' + resp.status + ')');
     }
-
     return await resp.json();
   }
 
   /**
-   * 快速测试：验证 DeepSeek 连通性
-   * 在控制台执行: llm.test()
+   * 英文 Prompt → 阿里通义万相 → 图片
    */
+  async generate(prompt, negativePrompt = '') {
+    const body = { prompt };
+    if (negativePrompt) body.negativePrompt = negativePrompt;
+    const resp = await fetch(this.serverUrl + '/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || '/api/generate failed (HTTP ' + resp.status + ')');
+    }
+    return await resp.json();
+  }
+
   async test() {
-    console.log('🔗 测试 LLM 连通性...');
+    console.log('测试后端...');
     try {
-      const result = await this.parse('画一个红色的圆');
-      console.log('✅ LLM 连通成功:', result);
-      return result;
+      const r = await this.parse('画一棵樱花树');
+      console.log('parse 成功:', r);
+      return r;
     } catch (e) {
-      console.error('❌ LLM 连通失败:', e.message);
+      console.error('测试失败:', e.message);
       return null;
     }
   }
 }
 
-// 挂到全局
 if (typeof window !== 'undefined') {
   window.LLMService = LLMService;
   window.llm = new LLMService();

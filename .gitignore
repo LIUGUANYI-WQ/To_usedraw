@@ -1,6 +1,9 @@
 # API Key — 绝对不能提交
 .env
 
+# AI 生成图片
+generated/
+
 # C++ 编译产物
 build/
 *.exe
