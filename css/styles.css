@@ -249,6 +249,30 @@ body {
   margin: 0;
 }
 
+/* --- AI Prompt 预览 --- */
+.prompt-preview {
+  margin-top: 6px;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+.prompt-label {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+.prompt-text {
+  color: var(--color-text);
+}
+
+.prompt-meta {
+  margin-top: 4px;
+  font-size: 0.78rem;
+  color: var(--color-text-muted);
+  opacity: 0.8;
+}
+
 /* --- 响应式 --- */
 @media (max-width: 600px) {
   body { padding: 8px; }

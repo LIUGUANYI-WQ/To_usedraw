@@ -37,6 +37,9 @@
   /** @type {CommandParser} */
   let parser = null;
 
+  /** @type {LLMService} */
+  let llmSvc = null;
+
   function initCanvas() {
     if (!canvas) {
       console.error('Canvas 元素未找到');
@@ -44,9 +47,11 @@
     }
     engine = new DrawingEngine(canvas);
     parser = new CommandParser();
-    window.engine = engine;   // 暴露到全局，方便控制台测试
+    llmSvc = new LLMService();
+    window.engine = engine;
     window.parser = parser;
-    console.log('✅ DrawingEngine + CommandParser 初始化完成');
+    window.llm = llmSvc;
+    console.log('DrawingEngine + CommandParser + LLM 初始化完成');
     return true;
   }
 
@@ -106,9 +111,36 @@
    * 无法识别时的反馈
    */
   function showUnrecognized(text, confidence) {
-    console.log('[未识别] "' + text + '" (置信度: ' + (confidence * 100).toFixed(0) + '%)');
-    console.log('  试试说: "画一个圆"、"画一个红色的正方形"、"清空画布"');
-    canvasPlaceholder.textContent = '未识别: "' + text + '" — 试试说"画一个圆"';
+    console.log('[未识别] "' + text + '" (置信度: ' + (confidence * 100).toFixed(0) + '%  )');
+    canvasPlaceholder.textContent = '未识别: "' + text + '"';
+  }
+
+  function showLLMThinking() {
+    statusText.textContent = 'AI 思考中...';
+    statusDot.className = 'status-dot status-dot--listening';
+  }
+
+  function hideLLMThinking() {
+    if (isListening) { statusText.textContent = '监听中...'; }
+    else { statusText.textContent = '等待中'; statusDot.className = 'status-dot status-dot--idle'; }
+  }
+
+  /**
+   * 显示 AI 解析结果
+   */
+  function showParsedResult(result) {
+    // 展示纠正后文字和 Prompt 摘要
+    transcriptContent.innerHTML =
+      '<div class="transcript-final">"' + escapeHtml(result.correctedText || '') + '"</div>' +
+      '<div class="prompt-preview">' +
+        '<span class="prompt-label">Prompt:</span> ' +
+        '<span class="prompt-text">' + escapeHtml(result.englishPrompt || '') + '</span>' +
+      '</div>' +
+      '<div class="prompt-meta">' +
+        'Style: ' + escapeHtml(result.style || 'auto') +
+        ' &middot; ' + escapeHtml(result.analysis || '') +
+      '</div>';
+    canvasPlaceholder.textContent = 'AI 已理解: ' + (result.correctedText || '');
   }
 
   // Web Speech API
@@ -164,13 +196,35 @@
       if (interim) showInterim(interim.trim());
 
       if (final) {
-        showFinal(final.trim(), confidence);
-        // 接入 CommandParser → DrawingEngine
-        const cmd = parser.parse(final.trim());
+        const txt = final.trim();
+        showFinal(txt, confidence);
+
+        // 策略1: 正则优先（本地，0ms）
+        const cmd = parser.parse(txt);
         if (cmd) {
-          executeCommand(cmd, final.trim(), confidence);
+          executeCommand(cmd, txt, confidence);
+          return;
+        }
+
+        // 策略2: LLM 兜底（调后端 /api/parse → DeepSeek）
+        if (llmSvc) {
+          showLLMThinking();
+          llmSvc.parse(txt).then(result => {
+            hideLLMThinking();
+            if (result && result.englishPrompt) {
+              console.log('AI 理解:', result);
+              canvasPlaceholder.textContent = 'AI: ' + (result.correctedText || txt);
+              showParsedResult(result);
+            } else {
+              showUnrecognized(txt, confidence);
+            }
+          }).catch(e => {
+            hideLLMThinking();
+            console.error('LLM 解析失败:', e);
+            showUnrecognized(txt, confidence);
+          });
         } else {
-          showUnrecognized(final.trim(), confidence);
+          showUnrecognized(txt, confidence);
         }
       }
     };
