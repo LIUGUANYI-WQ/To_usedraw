@@ -215,80 +215,103 @@ int main() {
             return;
         }
 
-        // DashScope Z-Image-Turbo 原生异步 API
+        // wanx-v1 异步 API（httplib + OpenSSL 直连，零 system()）
         json dashBody;
-        dashBody["model"] = "zimage-turbo";
+        dashBody["model"] = "wanx-v1";
         dashBody["input"]["prompt"] = prompt;
         dashBody["parameters"]["size"] = "1024*1024";
         dashBody["parameters"]["n"] = 1;
 
-        // 1. 提交生成任务
-        std::ofstream("_gen_req.json") << dashBody.dump();
-        std::string submitCmd =
-            "curl -s --max-time 30 "
-            "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis "
-            "-H \"Content-Type: application/json\" "
-            "-H \"X-DashScope-Async: enable\" "
-            "-H \"Authorization: Bearer " + g_dashscopeKey + "\" "
-            "-d @_gen_req.json > _gen_resp.json 2>&1";
-        system(submitCmd.c_str());
+        // 1. 提交任务
+        httplib::Client dashCli("https://dashscope.aliyuncs.com");
+        dashCli.set_read_timeout(30);
 
-        std::ifstream respFile("_gen_resp.json");
-        std::string raw((std::istreambuf_iterator<char>(respFile)),
-                         std::istreambuf_iterator<char>());
-        respFile.close();
-        fs::remove("_gen_req.json");
-        fs::remove("_gen_resp.json");
+        // 手动构造 Request，完全控制所有 header（DashScope 对 Accept 敏感）
+        httplib::Request subReq;
+        subReq.method = "POST";
+        subReq.path = "/api/v1/services/aigc/text2image/image-synthesis";
+        subReq.set_header("Content-Type", "application/json");
+        subReq.set_header("X-DashScope-Async", "enable");
+        subReq.set_header("Authorization", "Bearer " + g_dashscopeKey);
+        subReq.body = dashBody.dump();
 
-        json submitResp;
-        try { submitResp = json::parse(raw); } catch (...) {
+        auto submitRes = dashCli.send(subReq);
+
+        if (!submitRes) {
             res.status = 502;
-            json err; err["error"] = "invalid response"; err["raw"] = raw.substr(0, 300);
-            res.set_content(err.dump(), "application/json");
-            std::cerr << "[GENERATE SUBMIT] parse failed: " << raw.substr(0, 300) << std::endl; return;
+            res.set_content("{\"error\":\"dashscope submit failed\"}", "application/json");
+            std::cerr << "[GENERATE] submit: no response" << std::endl;
+            return;
+        }
+        json submitResp;
+        try { submitResp = json::parse(submitRes->body); } catch (...) {
+            res.status = 502;
+            res.set_content("{\"error\":\"invalid submit response\"}", "application/json");
+            std::cerr << "[GENERATE] submit parse: " << submitRes->body.substr(0, 300) << std::endl;
+            return;
         }
         if (submitResp.contains("code") && !submitResp["code"].is_null()) {
-            std::string msg = submitResp.value("message", "");
             res.status = 502;
-            json err; err["error"] = msg; err["raw"] = raw.substr(0, 400);
+            json err;
+            err["error"] = submitResp.value("message", "");
+            err["raw"] = submitRes->body.substr(0, 300);
             res.set_content(err.dump(), "application/json");
-            std::cerr << "[GENERATE SUBMIT] " << raw.substr(0, 400) << std::endl; return;
+            std::cerr << "[GENERATE] submit error: " << submitRes->body << std::endl;
+            return;
         }
 
         std::string taskId = submitResp["output"]["task_id"];
+        std::cout << "[GENERATE] task: " << taskId << std::endl;
 
-        // 2. 轮询直到完成
+        // 2. 轮询
         std::string imageUrl;
         for (int i = 0; i < 20; i++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            std::string pollCmd =
-                "curl -s "
-                "https://dashscope.aliyuncs.com/api/v1/tasks/" + taskId +
-                " -H \"Authorization: Bearer " + g_dashscopeKey + "\" > _gen_resp.json 2>&1";
-            system(pollCmd.c_str());
+            auto pollRes = dashCli.Get(
+                ("/api/v1/tasks/" + taskId).c_str(),
+                {{"Authorization", "Bearer " + g_dashscopeKey}});
 
-            std::ifstream pf("_gen_resp.json");
-            std::string pRaw((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
-            pf.close();
-            json pResp = json::parse(pRaw);
+            if (!pollRes) continue;
+            json pResp;
+            try { pResp = json::parse(pollRes->body); } catch (...) { continue; }
             std::string status = pResp["output"].value("task_status", "");
             if (status == "SUCCEEDED") {
                 imageUrl = pResp["output"]["results"][0].value("url", "");
                 break;
             } else if (status == "FAILED") {
-                res.status = 502; res.set_content("{\"error\":\"generation failed\"}", "application/json"); return;
+                res.status = 502;
+                res.set_content("{\"error\":\"generation failed\"}", "application/json");
+                return;
             }
         }
 
         if (imageUrl.empty()) {
-            res.status = 502; res.set_content("{\"error\":\"timeout\"}", "application/json"); return;
+            res.status = 502;
+            res.set_content("{\"error\":\"timeout\"}", "application/json");
+            return;
         }
 
         // 3. 下载图片
+        std::string host, path;
+        auto slashSlash = imageUrl.find("//");
+        if (slashSlash != std::string::npos) {
+            auto hostStart = slashSlash + 2;
+            auto pathStart = imageUrl.find('/', hostStart);
+            host = imageUrl.substr(hostStart, pathStart - hostStart);
+            path = imageUrl.substr(pathStart);
+        }
+        httplib::Client dlCli("https://" + host);
+        dlCli.set_read_timeout(30);
+        auto dlRes = dlCli.Get(path.c_str());
+        if (!dlRes || dlRes->status != 200) {
+            res.status = 502;
+            res.set_content("{\"error\":\"image download failed\"}", "application/json");
+            return;
+        }
+
         static int imgIdx = 0; imgIdx++;
         std::string localPath = "generated/img_" + std::to_string(imgIdx) + ".png";
-        std::string dlCmd = "curl -s --max-time 30 \"" + imageUrl + "\" -o " + localPath + " 2>&1";
-        system(dlCmd.c_str());
+        std::ofstream(localPath, std::ios::binary) << dlRes->body;
 
         json out;
         out["imageUrl"]  = imageUrl;
