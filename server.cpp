@@ -12,8 +12,9 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 #include "speech_recognizer.h"
+#include "spark_client.h"
 
-#include <cctype>
+#include <curl/curl.h>
 #include <map>
 #include <mutex>
 #include <chrono>
@@ -32,6 +33,7 @@ namespace fs = std::filesystem;
 static std::string g_deepseekKey;
 static std::string g_zhipuKey;
 static std::string g_dashscopeKey;
+static std::string g_sparkApiPassword;
 static XfyunConfig g_xfyunCfg;
 
 // 讯飞会话
@@ -63,6 +65,7 @@ static void initApiKeys() {
         if (k == "DEEPSEEK_API_KEY")   g_deepseekKey = v;
         if (k == "ZHIPU_API_KEY")      g_zhipuKey = v;
         if (k == "DASHSCOPE_API_KEY")  g_dashscopeKey = v;
+        if (k == "SPARK_API_PASSWORD") g_sparkApiPassword = v;
         if (k == "XFYUN_APP_ID")        g_xfyunCfg.appId = v;
         if (k == "XFYUN_API_KEY")       g_xfyunCfg.apiKey = v;
         if (k == "XFYUN_API_SECRET")    g_xfyunCfg.apiSecret = v;
@@ -127,8 +130,13 @@ static const char* PARSE_SYSTEM_PROMPT =
 // ===== main =====
 int main() {
     initApiKeys();
+
+    // 全局初始化 libcurl（必须在多线程使用前调用一次）
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     std::cout << "[INFO] DeepSeek: " << (g_deepseekKey.empty() ? "NOT FOUND" : "loaded")
               << "  DashScope: " << (g_dashscopeKey.empty() ? "NOT FOUND" : "loaded")
+              << "  Spark: " << (g_sparkApiPassword.empty() ? "NOT FOUND" : "loaded")
               << "  Xfyun: " << (g_xfyunCfg.isValid() ? "loaded" : "NOT FOUND") << std::endl;
 
     // 创建 generated 目录（图片输出）
@@ -145,7 +153,7 @@ int main() {
         res.set_content(b.dump(), "application/json");
     });
 
-    // ---- POST /api/parse -------------------------------------------------
+    // ---- POST /api/parse (星火 Lite → 优化 Prompt) ---------------------
     svr.Post("/api/parse", [](const httplib::Request& req, httplib::Response& res) {
         json reqBody;
         try { reqBody = json::parse(req.body); } catch (...) {
@@ -161,54 +169,64 @@ int main() {
             return;
         }
 
-        if (g_deepseekKey.empty()) {
+        if (g_sparkApiPassword.empty()) {
             res.status = 500;
-            res.set_content("{\"error\":\"API key not set\"}", "application/json");
+            res.set_content("{\"error\":\"SPARK_API_PASSWORD not set\"}", "application/json");
             return;
         }
 
-        std::string raw;
-        if (!callDeepSeek(PARSE_SYSTEM_PROMPT, text, raw) || raw.empty()) {
+        SparkClient spark(g_sparkApiPassword);
+        std::string prompt;
+        if (!spark.optimizePrompt(text, prompt)) {
             res.status = 502;
-            res.set_content("{\"error\":\"DeepSeek API failed\"}", "application/json");
+            res.set_content("{\"error\":\"Spark API failed\"}", "application/json");
             return;
         }
 
-        // Parse response
-        json apiResp;
-        try { apiResp = json::parse(raw); } catch (...) {
-            res.status = 502;
-            res.set_content("{\"error\":\"invalid API response\"}", "application/json");
-            return;
-        }
-
-        std::string content = apiResp["choices"][0]["message"]["content"];
-
-        // Strip markdown
-        {
-            auto p = content.find("```json");
-            if (p != std::string::npos) content = content.substr(p + 7);
-            else { p = content.find("```"); if (p != std::string::npos) content = content.substr(p + 3); }
-            p = content.rfind("```");
-            if (p != std::string::npos) content = content.substr(0, p);
-            auto a = content.find_first_not_of(" \t\n\r");
-            auto b = content.find_last_not_of(" \t\n\r");
-            if (a != std::string::npos) content = content.substr(a, b - a + 1);
-        }
-
-        json parsed;
-        try { parsed = json::parse(content); } catch (...) {
-            res.status = 502;
-            json err;
-            err["error"] = "LLM output not valid JSON";
-            err["raw"] = content;
-            res.set_content(err.dump(), "application/json");
-            return;
-        }
-
-        res.set_content(parsed.dump(), "application/json");
+        json out;
+        out["correctedText"] = text;
+        out["englishPrompt"] = prompt;
+        out["style"] = "auto";
+        out["analysis"] = "";
+        res.set_content(out.dump(), "application/json");
         std::cout << "[PARSE] \"" << text.substr(0, 40) << "\" -> "
-                  << parsed.value("englishPrompt", "?").substr(0, 60) << "..." << std::endl;
+                  << prompt.substr(0, 60) << "..." << std::endl;
+    });
+
+    // ---- POST /api/spark-parse (讯飞星火 Lite → 优化 Prompt) -----------
+    svr.Post("/api/spark-parse", [](const httplib::Request& req, httplib::Response& res) {
+        json reqBody;
+        try { reqBody = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid JSON\"}", "application/json");
+            return;
+        }
+
+        std::string text = reqBody.value("text", "");
+        if (text.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing text\"}", "application/json");
+            return;
+        }
+
+        if (g_sparkApiPassword.empty()) {
+            res.status = 500;
+            res.set_content("{\"error\":\"SPARK_API_PASSWORD not set\"}", "application/json");
+            return;
+        }
+
+        SparkClient spark(g_sparkApiPassword);
+        std::string prompt;
+        if (!spark.optimizePrompt(text, prompt)) {
+            res.status = 502;
+            res.set_content("{\"error\":\"Spark API failed\"}", "application/json");
+            return;
+        }
+
+        json out;
+        out["englishPrompt"] = prompt;
+        out["rawText"] = text;
+        res.set_content(out.dump(), "application/json");
     });
 
     // ---- POST /api/generate (DashScope Z-Image-Turbo) --------------------

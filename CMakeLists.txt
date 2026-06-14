@@ -15,6 +15,11 @@ endif()
 find_package(OpenSSL REQUIRED)
 
 # ============================================================
+# libcurl (星火 Lite API HTTPS 请求)
+# ============================================================
+find_package(CURL REQUIRED)
+
+# ============================================================
 # 本地 header-only 库
 # ============================================================
 add_library(httplib INTERFACE)
@@ -37,6 +42,8 @@ add_executable(server
     server.cpp
     speech_recognizer.h
     speech_recognizer.cpp
+    spark_client.h
+    spark_client.cpp
 )
 
 target_include_directories(server PRIVATE ${CMAKE_SOURCE_DIR}/ixwebsocket_src/ixwebsocket)
@@ -47,6 +54,7 @@ target_link_libraries(server PRIVATE
     ixwebsocket
     OpenSSL::SSL
     OpenSSL::Crypto
+    CURL::libcurl
 )
 
 if(WIN32)
