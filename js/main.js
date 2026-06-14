@@ -234,15 +234,14 @@
       if (finalProcessed) return;
       finalProcessed = true;
 
-      accumulatedText += text;
-      // 语音结束后自动发送
-      processUserInput(accumulatedText);
-      accumulatedText = '';
+      // 最终结果：发送
+      processUserInput(text);
+      textInput.value = '';
 
       if (isListening) stopListening();
     } else {
-      // 中间结果：显示在输入框
-      textInput.value = accumulatedText + text;
+      // 中间结果：显示在输入框（累积文本 + 当前中间）
+      textInput.value = text;
     }
   }
 
@@ -456,15 +455,6 @@
   micBtn.addEventListener('click', function () {
     if (isListening) stopListening();
     else startListening();
-  });
-
-  // 自动/手动发送切换
-  const autoSendToggle = document.getElementById('autoSendToggle');
-  const autoSendLabel = autoSendToggle.querySelector('.auto-send-label');
-  autoSendToggle.addEventListener('click', function () {
-    autoSendVoice = !autoSendVoice;
-    autoSendLabel.textContent = autoSendVoice ? '自动' : '手动';
-    autoSendToggle.classList.toggle('auto-send--manual', !autoSendVoice);
   });
 
   // 发送按钮

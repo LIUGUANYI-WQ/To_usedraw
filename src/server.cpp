@@ -45,7 +45,8 @@ static XfyunConfig g_xfyunCfg;
 // 讯飞会话
 struct XfyunSess {
     std::unique_ptr<SpeechRecognizer> reco;
-    std::string text;
+    std::string text;          // 累积的最终文本
+    std::string interimText;   // 当前中间结果（每次覆盖）
     bool initialized = false;  // 是否已尝试过建立连接
     bool ended = false;
 };
@@ -810,7 +811,15 @@ int main() {
         if (!sess.initialized && g_xfyunCfg.isValid()) {
             sess.reco = std::make_unique<SpeechRecognizer>(g_xfyunCfg);
             sess.reco->setOnText([&sess](const std::string& t, bool final, double conf) {
-                sess.text += t;
+                if (final) {
+                    // 每句最终结果：中间文本 + 最终部分一起追加
+                    // 讯飞协议：中间结果含完整句子，最终结果可能只有标点
+                    sess.text += sess.interimText + t;
+                    sess.interimText.clear();
+                } else {
+                    // 中间结果：暂存（每次覆盖，因为中间结果是当前句子的完整内容）
+                    sess.interimText = t;
+                }
             });
             sess.initialized = true;
             if (!sess.reco->connect()) {
@@ -826,6 +835,19 @@ int main() {
             if (!pcm.empty()) {
                 sess.reco->sendAudio(pcm);
             }
+        } else if (sess.ended || (sess.reco && !sess.reco->isConnected())) {
+            // 会话已结束或连接已断开，返回最终结果让前端停止
+            std::string finalText = sess.text;
+            if (sess.reco) sess.reco->disconnect();
+            g_sessions.erase(sid);
+
+            json out;
+            out["text"] = finalText;
+            out["isFinal"] = true;
+            out["confidence"] = 0.9;
+            res.set_content(out.dump(), "application/json");
+            std::cout << "[SPEECH] session " << sid << " already ended. final: " << finalText << std::endl;
+            return;
         }
 
         // 检测讯飞连接是否已断开（VAD 静音自动关闭 / 错误断连）
@@ -845,7 +867,8 @@ int main() {
         }
 
         json out;
-        out["text"] = sess.text;
+        out["text"] = sess.text + sess.interimText;  // 累积文本 + 当前中间结果
+        out["interimText"] = sess.interimText;       // 单独返回中间结果
         out["isFinal"] = false;
         out["confidence"] = 0.0;
         res.set_content(out.dump(), "application/json");

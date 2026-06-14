@@ -222,10 +222,20 @@ class AudioCapture {
 
       if (resp.ok) {
         const data = await resp.json().catch(() => ({}));
-        if (data.text && data.text.trim()) {
-          if (data.isFinal) this._gotFinal = true;
+        const fullText = (data.text || '').trim();
+        if (fullText) {
+          if (data.isFinal) {
+            this._gotFinal = true;
+            // 收到最终结果，停止发送后续分片
+            this.isCapturing = false;
+            if (this._timerId) {
+              clearInterval(this._timerId);
+              this._timerId = null;
+            }
+          }
           this.callbacks.onText({
-            text: data.text.trim(),
+            text: fullText,
+            interimText: (data.interimText || '').trim(),
             isFinal: data.isFinal || false,
             confidence: data.confidence || 0,
           });
