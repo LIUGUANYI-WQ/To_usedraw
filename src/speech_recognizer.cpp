@@ -118,8 +118,15 @@ std::string SpeechRecognizer::buildAuthUrl() {
         "GET " + m_cfg.uri + " HTTP/1.1";
 
     std::string signature = hmacSha256Base64(m_cfg.apiSecret, sigOrigin);
-    std::string authPlain = m_cfg.apiKey + ":" + signature;
-    std::string authorization = base64Encode(authPlain);
+
+    // 讯飞要求的 authorization_origin 格式
+    std::string authOrigin =
+        "api_key=\"" + m_cfg.apiKey + "\", "
+        "algorithm=\"hmac-sha256\", "
+        "headers=\"host date request-line\", "
+        "signature=\"" + signature + "\"";
+
+    std::string authorization = base64Encode(authOrigin);
 
     return "wss://" + m_cfg.host + m_cfg.uri +
            "?authorization=" + urlEncode(authorization) +
