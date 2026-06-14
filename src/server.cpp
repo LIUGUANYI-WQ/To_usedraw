@@ -80,7 +80,7 @@ struct Session {
 };
 
 static std::vector<User> g_users;
-static std::map<std::string, Session> g_sessions;  // token -> session
+static std::map<std::string, Session> g_authSessions;  // token -> auth session
 static std::mutex g_authMutex;
 static const std::string USERS_FILE = "users.json";
 
@@ -141,8 +141,8 @@ static std::string getCurrentUser(const httplib::Request& req) {
     if (!authHeader.empty() && authHeader.substr(0, 7) == "Bearer ") {
         std::string token = authHeader.substr(7);
         std::lock_guard<std::mutex> lk(g_authMutex);
-        auto it = g_sessions.find(token);
-        if (it != g_sessions.end() && it->second.expires > std::chrono::system_clock::now()) {
+        auto it = g_authSessions.find(token);
+        if (it != g_authSessions.end() && it->second.expires > std::chrono::system_clock::now()) {
             return it->second.username;
         }
     }
@@ -154,8 +154,8 @@ static std::string getCurrentUser(const httplib::Request& req) {
         auto end = cookie.find(';', start);
         std::string token = cookie.substr(start, end - start);
         std::lock_guard<std::mutex> lk(g_authMutex);
-        auto it = g_sessions.find(token);
-        if (it != g_sessions.end() && it->second.expires > std::chrono::system_clock::now()) {
+        auto it = g_authSessions.find(token);
+        if (it != g_authSessions.end() && it->second.expires > std::chrono::system_clock::now()) {
             return it->second.username;
         }
     }
@@ -851,7 +851,7 @@ int main() {
             sess.token = token;
             sess.username = username;
             sess.expires = std::chrono::system_clock::now() + std::chrono::hours(24);
-            g_sessions[token] = sess;
+            g_authSessions[token] = sess;
         }
         // 设置 Cookie
         res.set_header("Set-Cookie", "token=" + token + "; Path=/; Max-Age=86400; HttpOnly");
@@ -884,7 +884,7 @@ int main() {
             }
             if (!token.empty()) {
                 std::lock_guard<std::mutex> lk(g_authMutex);
-                g_sessions.erase(token);
+                g_authSessions.erase(token);
             }
         }
         res.set_header("Set-Cookie", "token=; Path=/; Max-Age=0; HttpOnly");
