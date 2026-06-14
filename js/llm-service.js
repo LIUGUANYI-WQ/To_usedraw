@@ -84,9 +84,10 @@ class LLMService {
   /**
    * 英文 Prompt → 阿里通义万相 → 图片
    */
-  async generate(prompt, negativePrompt = '') {
-    const body = { prompt };
+  async generate(prompt, negativePrompt = '', correctedText = '', model = 'flux-schnell') {
+    const body = { prompt, model };
     if (negativePrompt) body.negativePrompt = negativePrompt;
+    if (correctedText) body.correctedText = correctedText;
     const resp = await fetch(this.serverUrl + '/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

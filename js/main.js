@@ -1,6 +1,7 @@
 /**
  * 语音绘图工具 — 主入口
  * 使用 AudioCapture + 讯飞后端 WebSocket 做语音转文字
+ * PR2: 历史记录 | PR3: 新建对话 | PR4: 迭代调整
  */
 
 (function () {
@@ -20,6 +21,10 @@
   const errorMessage = document.getElementById('errorMessage');
   const canvas = document.getElementById('drawCanvas');
   const canvasPlaceholder = document.getElementById('canvasPlaceholder');
+  const newChatBtn = document.getElementById('newChatBtn');
+  const refineBtn = document.getElementById('refineBtn');
+  const historyList = document.getElementById('historyList');
+  const toggleHistoryBtn = document.getElementById('toggleHistoryBtn');
 
   // ===========================
   // 状态
@@ -43,6 +48,13 @@
 
   /** 是否已处理过最终结果（防止 VAD 自动结束 + 手动停止重复触发） */
   let finalProcessed = false;
+
+  /** 当前对话上下文：最后一次成功的生成结果 */
+  let lastGenResult = null;
+  let lastParseResult = null;
+
+  /** 历史记录缓存 */
+  let historyCache = [];
 
   function initCanvas() {
     if (!canvas) {
@@ -125,6 +137,59 @@
   }
 
   // ===========================
+  // 图片生成（统一入口，供 processFinalText 和 refine 复用）
+  // ===========================
+
+  function generateImage(parseResult) {
+    const overlay = document.getElementById('loadingOverlay');
+    const timerEl = document.getElementById('loadingTimer');
+    const loadText = document.getElementById('loadingText');
+    const modelSelect = document.getElementById('modelSelect');
+    const selectedModel = modelSelect ? modelSelect.value : 'flux-schnell';
+    let elapsed = 0;
+    const startTime = Date.now();
+    const timerId = setInterval(() => {
+      elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      if (timerEl) timerEl.textContent = '已等待 ' + elapsed + ' 秒';
+      if (loadText && elapsed > 5) loadText.textContent = '还在生成中，请耐心等候...';
+    }, 200);
+
+    if (overlay) overlay.style.display = 'flex';
+    statusText.textContent = 'AI 生成图片中...';
+    canvasPlaceholder.textContent = '生成中...';
+
+    // 传递 correctedText 和 model 以便后端选择模型
+    return llmSvc.generate(
+      parseResult.englishPrompt,
+      parseResult.negativePrompt || '',
+      parseResult.correctedText || '',
+      selectedModel
+    ).then(genResult => {
+      clearInterval(timerId);
+      if (overlay) overlay.style.display = 'none';
+      hideLLMThinking();
+      if (genResult && (genResult.imageUrl || genResult.localPath)) {
+        const imgUrl = genResult.localPath || genResult.imageUrl;
+        engine.displayImage(imgUrl);
+        canvasPlaceholder.textContent = '✅ ' + (parseResult.correctedText || '') + ' （耗时 ' + elapsed + 's）';
+        // 保存上下文用于迭代调整
+        lastGenResult = genResult;
+        lastParseResult = parseResult;
+        refineBtn.style.display = 'flex';
+        // 刷新历史
+        loadHistory();
+      } else {
+        canvasPlaceholder.textContent = '生成失败，请重试';
+      }
+    }).catch(err => {
+      clearInterval(timerId);
+      if (overlay) overlay.style.display = 'none';
+      hideLLMThinking();
+      throw err;
+    });
+  }
+
+  // ===========================
   // AudioCapture 回调
   // ===========================
 
@@ -173,39 +238,7 @@
         console.log('AI 理解:', parseResult);
         canvasPlaceholder.textContent = 'AI: ' + (parseResult.correctedText || text);
         showParsedResult(parseResult);
-
-        // 生成图片
-        const overlay = document.getElementById('loadingOverlay');
-        const timerEl = document.getElementById('loadingTimer');
-        const loadText = document.getElementById('loadingText');
-        let elapsed = 0;
-        const startTime = Date.now();
-        const timerId = setInterval(() => {
-          elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-          if (timerEl) timerEl.textContent = '已等待 ' + elapsed + ' 秒';
-          if (loadText && elapsed > 5) loadText.textContent = '还在生成中，请耐心等候...';
-        }, 200);
-
-        if (overlay) overlay.style.display = 'flex';
-        statusText.textContent = 'AI 生成图片中...';
-        canvasPlaceholder.textContent = '生成中...';
-
-        return llmSvc.generate(parseResult.englishPrompt, parseResult.negativePrompt || '').then(genResult => {
-          clearInterval(timerId);
-          if (overlay) overlay.style.display = 'none';
-          hideLLMThinking();
-          if (genResult && (genResult.imageUrl || genResult.localPath)) {
-            const imgUrl = genResult.localPath || genResult.imageUrl;
-            engine.displayImage(imgUrl);
-            canvasPlaceholder.textContent = '✅ ' + (parseResult.correctedText || text) + ' （耗时 ' + elapsed + 's）';
-          } else {
-            canvasPlaceholder.textContent = '生成失败，请重试';
-          }
-        }).catch(err => {
-          clearInterval(timerId);
-          if (overlay) overlay.style.display = 'none';
-          throw err;
-        });
+        return generateImage(parseResult);
       }).catch(e => {
         hideLLMThinking();
         console.error('AI 链路失败:', e);
@@ -214,6 +247,96 @@
     } else {
       showUnrecognized(text);
     }
+  }
+
+  // ===========================
+  // PR3: 新建对话
+  // ===========================
+
+  function newChat() {
+    // 清空当前画布和上下文
+    if (engine) engine.clear();
+    lastGenResult = null;
+    lastParseResult = null;
+    accumulatedText = '';
+    finalProcessed = false;
+    refineBtn.style.display = 'none';
+
+    // 重置 UI
+    transcriptContent.innerHTML = '<span class="transcript-placeholder">语音识别内容将实时显示在这里...</span>';
+    canvasPlaceholder.textContent = '🎤 说出你想要的画面，AI 帮你画出来';
+    confidenceBar.hidden = true;
+    hideError();
+
+    console.log('[新对话] 已清空');
+  }
+
+  // ===========================
+  // PR4: 迭代调整图片
+  // ===========================
+
+  function refineImage() {
+    if (!lastParseResult || !llmSvc) return;
+
+    // 提示用户说话来描述调整
+    transcriptContent.innerHTML =
+      '<div class="transcript-final">请说出你想要的调整...</div>' +
+      '<div class="prompt-meta">基于上一张图继续优化</div>';
+
+    // 开始监听
+    startListening();
+  }
+
+  // ===========================
+  // PR2: 历史记录
+  // ===========================
+
+  async function loadHistory() {
+    try {
+      const resp = await fetch('/api/history');
+      if (!resp.ok) return;
+      historyCache = await resp.json();
+      renderHistory();
+    } catch (e) {
+      console.warn('加载历史失败:', e.message);
+    }
+  }
+
+  function renderHistory() {
+    if (!historyCache || historyCache.length === 0) {
+      historyList.innerHTML = '<span class="history-placeholder">暂无历史记录</span>';
+      return;
+    }
+
+    historyList.innerHTML = historyCache.map(item =>
+      '<div class="history-item" data-id="' + escapeHtml(item.id) + '">' +
+        '<img class="history-thumb" src="' + escapeHtml(item.localPath) + '" alt="历史图片" loading="lazy">' +
+        '<div class="history-info">' +
+          '<div class="history-prompt">' + escapeHtml(item.correctedText || item.prompt) + '</div>' +
+          '<div class="history-time">' + escapeHtml(item.timestamp) + ' · ' + escapeHtml(item.provider) + '</div>' +
+        '</div>' +
+      '</div>'
+    ).join('');
+
+    // 点击历史项 → 显示该图片
+    historyList.querySelectorAll('.history-item').forEach(el => {
+      el.addEventListener('click', function () {
+        const id = this.dataset.id;
+        const item = historyCache.find(h => h.id === id);
+        if (item && item.localPath) {
+          engine.displayImage(item.localPath);
+          canvasPlaceholder.textContent = '历史: ' + (item.correctedText || item.prompt);
+          // 设置为当前上下文，方便继续调整
+          lastParseResult = {
+            englishPrompt: item.prompt,
+            negativePrompt: item.negativePrompt || '',
+            correctedText: item.correctedText || '',
+          };
+          lastGenResult = { localPath: item.localPath };
+          refineBtn.style.display = 'flex';
+        }
+      });
+    });
   }
 
   // ===========================
@@ -345,6 +468,14 @@
     else startListening();
   });
 
+  newChatBtn.addEventListener('click', newChat);
+  refineBtn.addEventListener('click', refineImage);
+
+  toggleHistoryBtn.addEventListener('click', function () {
+    const collapsed = historyList.classList.toggle('collapsed');
+    toggleHistoryBtn.textContent = collapsed ? '展开' : '收起';
+  });
+
   // ===========================
   // 启动
   // ===========================
@@ -358,6 +489,9 @@
       showError('Canvas 初始化失败，请刷新页面重试');
       return;
     }
+
+    // 加载历史记录
+    loadHistory();
 
     console.log('画布尺寸:', canvas.width + '×' + canvas.height);
     console.log('💡 点击"开始监听"后对麦克风说中文');

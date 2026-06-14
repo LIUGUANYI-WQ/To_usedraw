@@ -42,6 +42,22 @@
         <span class="mic-label" id="micLabel">开始监听</span>
       </button>
 
+      <button id="newChatBtn" class="action-btn" title="新建对话">
+        <span>➕</span> 新对话
+      </button>
+
+      <button id="refineBtn" class="action-btn action-btn--accent" title="基于当前图片继续调整" style="display:none">
+        <span>🔄</span> 继续调整
+      </button>
+
+      <div class="model-selector">
+        <label for="modelSelect" class="model-label">模型</label>
+        <select id="modelSelect" class="model-select">
+          <option value="flux-schnell">FLUX.1-schnell (快速)</option>
+          <option value="kolors">Kolors (免费/中文)</option>
+        </select>
+      </div>
+
       <div class="status-indicator" id="statusIndicator">
         <span class="status-dot status-dot--idle" id="statusDot"></span>
         <span class="status-text" id="statusText">等待中</span>
@@ -56,6 +72,17 @@
       </div>
       <div class="confidence-bar" id="confidenceBar" hidden>
         <div class="confidence-fill" id="confidenceFill"></div>
+      </div>
+    </section>
+
+    <!-- 历史记录 -->
+    <section class="history-area" id="historyArea">
+      <div class="history-header">
+        <span>历史记录</span>
+        <button id="toggleHistoryBtn" class="toggle-btn">收起</button>
+      </div>
+      <div class="history-list" id="historyList">
+        <span class="history-placeholder">暂无历史记录</span>
       </div>
     </section>
 
