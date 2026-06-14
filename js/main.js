@@ -1,6 +1,6 @@
 /**
  * 语音绘图工具 — 主入口
- * PR 2.2: 集成 CommandParser，打通中文语音 → 绘图闭环
+ * 使用 AudioCapture + 讯飞后端 WebSocket 做语音转文字
  */
 
 (function () {
@@ -22,14 +22,9 @@
   const canvasPlaceholder = document.getElementById('canvasPlaceholder');
 
   // ===========================
-  // DrawingEngine
+  // 状态
   // ===========================
   let isListening = false;
-  let recognition = null;
-  let restartDelayId = null;      // onend 延迟重启定时器
-  let consecutiveRestarts = 0;    // 连续重启计数
-  const MAX_RESTARTS = 5;         // 连续重启上限
-  const RESTART_DELAY = 300;      // 重启延迟（毫秒）
 
   /** @type {DrawingEngine} */
   let engine = null;
@@ -39,6 +34,12 @@
 
   /** @type {LLMService} */
   let llmSvc = null;
+
+  /** @type {AudioCapture} */
+  let audioCapture = null;
+
+  /** 累计识别文本 */
+  let accumulatedText = '';
 
   function initCanvas() {
     if (!canvas) {
@@ -56,38 +57,22 @@
   }
 
   /**
-   * 控制台测试函数：
-   *   drawTest()                         → 默认红色测试圆
-   *   drawTest('blue')                   → 蓝色圆
-   *   engine.drawRectangle({ fillColor: '#3498db' })   → 蓝色矩形
-   *   engine.drawTriangle({ fillColor: '#f1c40f' })    → 黄色三角形
-   *   engine.clear()                     → 清空画布
+   * 控制台测试函数
    */
   window.drawTest = function (color = '#e74c3c', radius = 80) {
     if (!engine) { console.error('DrawingEngine 未初始化'); return; }
     engine.drawCircle({ fillColor: color, radius: radius });
-    console.log('✅ 测试圆 — 颜色:', color, '半径:', radius);
-    console.log('   试试: engine.drawRectangle({ fillColor: "#3498db" })');
-    console.log('   试试: engine.drawTriangle({ fillColor: "#f1c40f" })');
-    console.log('   试试: engine.clear()');
+    console.log('测试圆 — 颜色:', color, '半径:', radius);
   };
 
-  // ===========================
   // ===========================
   // 指令执行 & 反馈
   // ===========================
 
-  /**
-   * 执行解析后的绘图指令
-   * @param {object} cmd - CommandParser 返回的命令对象
-   * @param {string} rawText - 原始语音文本
-   * @param {number} confidence - 识别置信度
-   */
   function executeCommand(cmd, rawText, confidence) {
     console.log('[指令]', cmd.action, cmd.params);
     console.log('  命中策略:', cmd.matchedStrategy);
     console.log('  识别文本: "' + rawText + '"');
-    console.log('  置信度:', (confidence * 100).toFixed(0) + '%');
 
     switch (cmd.action) {
       case 'draw_shape':
@@ -107,11 +92,8 @@
     }
   }
 
-  /**
-   * 无法识别时的反馈
-   */
-  function showUnrecognized(text, confidence) {
-    console.log('[未识别] "' + text + '" (置信度: ' + (confidence * 100).toFixed(0) + '%  )');
+  function showUnrecognized(text) {
+    console.log('[未识别] "' + text + '"');
     canvasPlaceholder.textContent = '未识别: "' + text + '"';
   }
 
@@ -125,11 +107,7 @@
     else { statusText.textContent = '等待中'; statusDot.className = 'status-dot status-dot--idle'; }
   }
 
-  /**
-   * 显示 AI 解析结果
-   */
   function showParsedResult(result) {
-    // 展示纠正后文字和 Prompt 摘要
     transcriptContent.innerHTML =
       '<div class="transcript-final">"' + escapeHtml(result.correctedText || '') + '"</div>' +
       '<div class="prompt-preview">' +
@@ -143,14 +121,99 @@
     canvasPlaceholder.textContent = 'AI 已理解: ' + (result.correctedText || '');
   }
 
-  // Web Speech API
   // ===========================
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  // AudioCapture 回调
+  // ===========================
 
-  function checkSpeechSupport() {
-    if (!SpeechRecognition) {
+  function onCaptureText(data) {
+    const text = data.text;
+    const isFinal = data.isFinal;
+    const confidence = data.confidence;
+
+    if (isFinal) {
+      // 最终结果：追加到累计文本
+      accumulatedText += text;
+      showFinal(accumulatedText, confidence);
+      processFinalText(accumulatedText, confidence);
+      accumulatedText = '';  // 重置
+    } else {
+      // 中间结果：显示当前片段
+      showInterim(accumulatedText + text);
+    }
+  }
+
+  function processFinalText(text, confidence) {
+    // 策略1: 正则优先（本地，0ms）
+    const cmd = parser.parse(text);
+    if (cmd) {
+      executeCommand(cmd, text, confidence);
+      return;
+    }
+
+    // 策略2: LLM 全链路 — parse → generate → 展示图片
+    if (llmSvc) {
+      showLLMThinking();
+      statusText.textContent = 'AI 理解中...';
+      llmSvc.parse(text).then(parseResult => {
+        if (!parseResult || !parseResult.englishPrompt) {
+          hideLLMThinking();
+          showUnrecognized(text);
+          return;
+        }
+        console.log('AI 理解:', parseResult);
+        canvasPlaceholder.textContent = 'AI: ' + (parseResult.correctedText || text);
+        showParsedResult(parseResult);
+
+        // 生成图片
+        const overlay = document.getElementById('loadingOverlay');
+        const timerEl = document.getElementById('loadingTimer');
+        const loadText = document.getElementById('loadingText');
+        let elapsed = 0;
+        const startTime = Date.now();
+        const timerId = setInterval(() => {
+          elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+          if (timerEl) timerEl.textContent = '已等待 ' + elapsed + ' 秒';
+          if (loadText && elapsed > 5) loadText.textContent = '还在生成中，请耐心等候...';
+        }, 200);
+
+        if (overlay) overlay.style.display = 'flex';
+        statusText.textContent = 'AI 生成图片中...';
+        canvasPlaceholder.textContent = '生成中...';
+
+        return llmSvc.generate(parseResult.englishPrompt).then(genResult => {
+          clearInterval(timerId);
+          if (overlay) overlay.style.display = 'none';
+          hideLLMThinking();
+          if (genResult && (genResult.imageUrl || genResult.localPath)) {
+            const imgUrl = genResult.localPath || genResult.imageUrl;
+            engine.displayImage(imgUrl);
+            canvasPlaceholder.textContent = '✅ ' + (parseResult.correctedText || text) + ' （耗时 ' + elapsed + 's）';
+          } else {
+            canvasPlaceholder.textContent = '生成失败，请重试';
+          }
+        }).catch(err => {
+          clearInterval(timerId);
+          if (overlay) overlay.style.display = 'none';
+          throw err;
+        });
+      }).catch(e => {
+        hideLLMThinking();
+        console.error('AI 链路失败:', e);
+        canvasPlaceholder.textContent = '错误: ' + e.message;
+      });
+    } else {
+      showUnrecognized(text);
+    }
+  }
+
+  // ===========================
+  // 监听控制
+  // ===========================
+
+  function checkAudioSupport() {
+    if (!AudioCapture.isSupported()) {
       showError(
-        '当前浏览器不支持 Web Speech API。<br>' +
+        '当前浏览器不支持音频采集。<br>' +
         '请使用 <strong>Chrome</strong> 或 <strong>Edge</strong> 打开此页面。'
       );
       micBtn.disabled = true;
@@ -160,218 +223,49 @@
     return true;
   }
 
-  function createRecognition() {
-    const rec = _createRawRecognition();
-    recognition = rec;
-    return rec;
-  }
-
-  /**
-   * 创建原始 SpeechRecognition 实例（不替换全局 recognition）
-   * 供 createRecognition 和 onend 自动重启使用
-   */
-  function _createRawRecognition() {
-    const rec = new SpeechRecognition();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = 'zh-CN';
-    rec.maxAlternatives = 3;
-
-    rec.onresult = function (event) {
-      let interim = '';
-      let final = '';
-      let confidence = 0;
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        const transcript = result[0].transcript.trim();
-        if (result.isFinal) {
-          final += transcript + ' ';
-          confidence = result[0].confidence;
-        } else {
-          interim += transcript + ' ';
-        }
-      }
-
-      if (interim) showInterim(interim.trim());
-
-      if (final) {
-        const txt = final.trim();
-        showFinal(txt, confidence);
-
-        // 策略1: 正则优先（本地，0ms）
-        const cmd = parser.parse(txt);
-        if (cmd) {
-          executeCommand(cmd, txt, confidence);
-          return;
-        }
-
-        // 策略2: LLM 全链路 — parse → generate → 展示图片
-        if (llmSvc) {
-          showLLMThinking();
-          statusText.textContent = 'AI 理解中...';
-          llmSvc.parse(txt).then(parseResult => {
-            if (!parseResult || !parseResult.englishPrompt) {
-              hideLLMThinking();
-              showUnrecognized(txt, confidence);
-              return;
-            }
-            console.log('AI 理解:', parseResult);
-            canvasPlaceholder.textContent = 'AI: ' + (parseResult.correctedText || txt);
-            showParsedResult(parseResult);
-
-            // 生成图片 — 加载动画 + 计时器
-            const overlay = document.getElementById('loadingOverlay');
-            const timerEl = document.getElementById('loadingTimer');
-            const loadText = document.getElementById('loadingText');
-            let elapsed = 0;
-            const startTime = Date.now();
-            const timerId = setInterval(() => {
-              elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-              if (timerEl) timerEl.textContent = '已等待 ' + elapsed + ' 秒';
-              if (loadText && elapsed > 5) loadText.textContent = '还在生成中，请耐心等候...';
-            }, 200);
-
-            if (overlay) overlay.style.display = 'flex';
-            statusText.textContent = 'AI 生成图片中...';
-            canvasPlaceholder.textContent = '生成中...';
-
-            return llmSvc.generate(parseResult.englishPrompt).then(genResult => {
-              clearInterval(timerId);
-              if (overlay) overlay.style.display = 'none';
-              hideLLMThinking();
-              if (genResult && (genResult.imageUrl || genResult.localPath)) {
-                const imgUrl = genResult.localPath || genResult.imageUrl;
-                engine.displayImage(imgUrl);
-                canvasPlaceholder.textContent = '✅ ' + (parseResult.correctedText || txt) + ' （耗时 ' + elapsed + 's）';
-              } else {
-                canvasPlaceholder.textContent = '生成失败，请重试';
-              }
-            }).catch(err => {
-              clearInterval(timerId);
-              if (overlay) overlay.style.display = 'none';
-              throw err;
-            });
-          }).catch(e => {
-            hideLLMThinking();
-            console.error('AI 链路失败:', e);
-            canvasPlaceholder.textContent = '错误: ' + e.message;
-          });
-        } else {
-          showUnrecognized(txt, confidence);
-        }
-      }
-    };
-
-    rec.onerror = function (event) {
-      console.error('语音识别错误:', event.error, event.message);
-      switch (event.error) {
-        case 'not-allowed':
-          showError('麦克风权限被拒绝，请在浏览器设置中允许访问麦克风');
-          stopListening(true);
-          break;
-        case 'no-speech':
-          console.log('未检测到语音，继续监听...');
-          break;
-        case 'audio-capture':
-          showError('未检测到麦克风设备，请检查硬件连接');
-          stopListening(true);
-          break;
-        case 'network':
-          showError('语音识别网络连接失败，请检查网络');
-          break;
-        case 'aborted':
-          break;
-        default:
-          console.warn('未处理的语音错误:', event.error);
-      }
-    };
-
-    rec.onstart = function () {
-      console.log('语音识别已启动');
-      setListeningState(true);
-    };
-
-    rec.onend = function () {
-      console.log('语音识别会话结束');
-      if (!isListening) {
-        setListeningState(false);
-        return;
-      }
-
-      // 连续重启超出上限 → 放弃，提示用户手动重试
-      if (consecutiveRestarts >= MAX_RESTARTS) {
-        console.error('连续重启超过 ' + MAX_RESTARTS + ' 次，停止自动恢复');
-        stopListening(true);
-        showError('语音识别频繁中断，请检查网络后重新点击开始');
-        return;
-      }
-
-      // 延迟重启，避免和浏览器内部状态冲突
-      consecutiveRestarts++;
-      console.log('将在 ' + RESTART_DELAY + 'ms 后自动重启（第 ' + consecutiveRestarts + ' 次）...');
-      restartDelayId = setTimeout(() => {
-        restartDelayId = null;
-        if (!isListening) return;
-
-        // 重建 recognition 实例（旧实例可能处于 broken 状态）
-        try { rec.abort(); } catch (_) {}
-        const freshRec = _createRawRecognition();
-        recognition = freshRec;
-
-        try {
-          freshRec.start();
-          console.log('语音识别已自动重启');
-        } catch (e) {
-          console.error('重启失败:', e);
-          stopListening(true);
-          showError('语音识别意外中断，请点击按钮重新开始');
-        }
-      }, RESTART_DELAY);
-    };
-
-    return rec;
-  }
-
   function startListening() {
-    if (!recognition) recognition = createRecognition();
-    isListening = true;
-    consecutiveRestarts = 0;   // 重置重启计数
-    hideError();
-    try {
-      recognition.start();
-    } catch (e) {
-      console.warn('启动异常，尝试重置:', e.message);
-      try { recognition.stop(); } catch (_) {}
-      setTimeout(() => {
-        try { recognition.start(); } catch (e2) {
-          console.error('重试启动失败:', e2);
-          stopListening(true);
-          showError('无法启动语音识别，请刷新页面重试');
+    if (isListening) return;
+
+    // 每次监听创建新的 AudioCapture 实例
+    audioCapture = new AudioCapture({
+      uploadUrl: '/api/speech',
+      chunkInterval: 400,
+      onStart: () => {
+        isListening = true;
+        accumulatedText = '';
+        setListeningState(true);
+        hideError();
+      },
+      onStop: () => {
+        isListening = false;
+        setListeningState(false);
+      },
+      onError: (err) => {
+        console.error('AudioCapture 错误:', err);
+        if (err.type === 'mic-denied') {
+          showError('麦克风权限被拒绝，请在浏览器设置中允许访问麦克风');
+          stopListening();
         }
-      }, 200);
-    }
+      },
+      onText: onCaptureText,
+    });
+
+    audioCapture.start();
   }
 
-  function stopListening(errorOccurred = false) {
+  function stopListening() {
     isListening = false;
-    consecutiveRestarts = 0;  // 重置计数器
-
-    // 清除延迟重启定时器
-    if (restartDelayId) {
-      clearTimeout(restartDelayId);
-      restartDelayId = null;
+    if (audioCapture) {
+      audioCapture.stop();
+      audioCapture = null;
     }
-
-    if (recognition) {
-      try { recognition.abort(); } catch (_) {}
-    }
-    if (!errorOccurred) setListeningState(false);
+    setListeningState(false);
   }
 
   // ===========================
   // UI 更新
   // ===========================
+
   function setListeningState(listening) {
     if (listening) {
       micLabel.textContent = '停止监听';
@@ -401,7 +295,7 @@
     transcriptContent.innerHTML = '<span class="transcript-final">"' + escapeHtml(text) + '"</span>';
     canvasPlaceholder.textContent = '听到: "' + text + '"';
 
-    if (confidence !== undefined) {
+    if (confidence !== undefined && confidence > 0) {
       confidenceBar.hidden = false;
       const pct = Math.round(confidence * 100);
       confidenceFill.style.width = pct + '%';
@@ -444,10 +338,10 @@
   // 启动
   // ===========================
   function bootstrap() {
-    console.log('语音绘图工具 — 启动');
-    console.log('Web Speech API:', SpeechRecognition ? '支持' : '不支持');
+    console.log('语音绘图工具 — 启动（讯飞模式）');
+    console.log('AudioCapture:', AudioCapture.isSupported() ? '支持' : '不支持');
 
-    if (!checkSpeechSupport()) return;
+    if (!checkAudioSupport()) return;
 
     if (!initCanvas()) {
       showError('Canvas 初始化失败，请刷新页面重试');
@@ -455,8 +349,6 @@
     }
 
     console.log('画布尺寸:', canvas.width + '×' + canvas.height);
-    console.log('支持指令:', parser.getSupportedCommands()
-      .map(c => c.examples.join(', ')).join('\n          '));
     console.log('💡 点击"开始监听"后对麦克风说中文');
     console.log('💡 试试说: "画一个圆"、"画一个红色正方形"、"清空画布"');
     console.log('💡 控制台: drawTest() 手动绘图 / parser.parse("画一个圆") 测试解析');

@@ -1,6 +1,9 @@
 # API Key — 绝对不能提交
 .env
 
+# 第三方库源码
+ixwebsocket_src/
+
 # AI 生成图片
 generated/
 
@@ -19,3 +22,9 @@ Thumbs.db
 
 # Node（如果有的话）
 node_modules/
+
+# 测试/临时文件
+_ds_call.bat
+_ds_req.json
+_gen_resp.json
+test.md
