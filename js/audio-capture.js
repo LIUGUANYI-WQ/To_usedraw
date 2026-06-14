@@ -1,46 +1,53 @@
 /**
  * AudioCapture — 音频采集与分片上传模块
- * PR 5.1: 替换 Web Speech API，使用 MediaRecorder 采集音频
+ * 使用 Web Audio API 采集原始 PCM (16kHz/16bit/mono)，发二进制到后端 /api/speech
  *
- * 音频参数：16kHz / 16bit / 单声道（讯飞实时语音转写要求）
- * 分片间隔：每 400ms 发送一个音频块到后端
+ * 流程：
+ *   1. getUserMedia 获取麦克风
+ *   2. AudioContext + ScriptProcessor 采集 Float32 音频
+ *   3. 重采样到 16kHz，转 Int16 PCM
+ *   4. 每 400ms 发送一个 PCM 块到 /api/speech (binary POST)
+ *   5. 停止时发 /api/speech?end=1 通知后端结束
  */
 
 class AudioCapture {
   constructor(options = {}) {
-    /** 上传地址（C++ 后端 /api/speech） */
+    /** 上传地址 */
     this.uploadUrl = options.uploadUrl || '/api/speech';
 
-    /** 分片间隔（毫秒），讯飞建议 200-500ms */
+    /** 分片间隔（毫秒） */
     this.chunkInterval = options.chunkInterval || 400;
 
-    /** 音频约束：16kHz 单声道 */
-    this.constraints = {
-      audio: {
-        channelCount: 1,
-        sampleRate: 16000,
-        sampleSize: 16,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
-    };
+    /** 目标采样率（讯飞要求 16kHz） */
+    this.targetSampleRate = 16000;
 
-    /** @type {MediaRecorder|null} */
-    this.recorder = null;
+    /** @type {AudioContext|null} */
+    this.audioCtx = null;
 
     /** @type {MediaStream|null} */
     this.stream = null;
 
+    /** @type {ScriptProcessorNode|null} */
+    this.processor = null;
+
     /** 录制状态 */
     this.isCapturing = false;
 
+    /** PCM 缓冲区 */
+    this._pcmBuffer = [];
+
+    /** 定时发送 */
+    this._timerId = null;
+
+    /** 会话 ID */
+    this._sessionId = 'sess_' + Date.now();
+
     /** 事件回调 */
     this.callbacks = {
-      onStart:    options.onStart    || (() => {}),
-      onStop:     options.onStop     || (() => {}),
-      onChunk:    options.onChunk    || (() => {}),
-      onError:    options.onError    || (() => {}),
-      onText:     options.onText     || (() => {}),  // 后端返回的转写文字
+      onStart:  options.onStart  || (() => {}),
+      onStop:   options.onStop   || (() => {}),
+      onError:  options.onError  || (() => {}),
+      onText:   options.onText   || (() => {}),
     };
   }
 
@@ -49,74 +56,97 @@ class AudioCapture {
    */
   static isSupported() {
     return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
-              (window.MediaRecorder || window.webkitMediaRecorder));
+              (window.AudioContext || window.webkitAudioContext));
   }
 
   /**
    * 开始采集
    */
   async start() {
-    if (this.isCapturing) {
-      console.warn('AudioCapture: 已在采集中');
-      return;
-    }
+    if (this.isCapturing) return;
 
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia(this.constraints);
-    } catch (e) {
-      console.error('AudioCapture: 获取麦克风失败', e);
-      this.callbacks.onError({
-        type: 'mic-denied',
-        message: '麦克风权限被拒绝或设备不可用',
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
       });
+    } catch (e) {
+      console.error('AudioCapture: 麦克风获取失败', e);
+      this.callbacks.onError({ type: 'mic-denied', message: '麦克风权限被拒绝' });
       return;
     }
 
-    // 创建 MediaRecorder（audio/webm 是浏览器最通用的支持，后端转 PCM）
-    const mimeType = this._pickMimeType();
-    this.recorder = new MediaRecorder(this.stream, {
-      mimeType: mimeType,
-      audioBitsPerSecond: 256000,
-    });
+    // 创建 AudioContext
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    this.audioCtx = new AudioCtx({ sampleRate: this.targetSampleRate });
 
-    // 定时分片（每 chunkInterval ms 触发一次 dataavailable）
-    this.recorder.ondataavailable = (event) => {
-      if (event.data && event.data.size > 0) {
-        this._uploadChunk(event.data);
-      }
+    const source = this.audioCtx.createMediaStreamSource(this.stream);
+
+    // ScriptProcessor 采集原始 PCM（4096 帧缓冲）
+    this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1);
+    this.processor.onaudioprocess = (e) => {
+      if (!this.isCapturing) return;
+      const float32 = e.inputBuffer.getChannelData(0);
+      const int16 = this._float32ToInt16(float32);
+      this._pcmBuffer.push(...int16);
     };
 
-    this.recorder.onerror = (event) => {
-      console.error('AudioCapture: 录制错误', event.error);
-      this.callbacks.onError({
-        type: 'recorder-error',
-        message: '音频录制异常',
-      });
-    };
+    source.connect(this.processor);
+    this.processor.connect(this.audioCtx.destination);
 
-    this.recorder.onstop = () => {
-      this.isCapturing = false;
-    };
-
-    // 开始录制，每 chunkInterval ms 分片
-    this.recorder.start(this.chunkInterval);
     this.isCapturing = true;
     this.callbacks.onStart();
 
-    console.log('AudioCapture: 开始采集，分片间隔 ' + this.chunkInterval + 'ms');
+    // 定时发送 PCM 分片
+    this._timerId = setInterval(() => this._sendChunk(), this.chunkInterval);
+
+    console.log('AudioCapture: 开始采集, sampleRate=' + this.audioCtx.sampleRate);
   }
 
   /**
    * 停止采集
    */
-  stop() {
-    if (!this.recorder || this.recorder.state === 'inactive') return;
+  async stop() {
+    if (!this.isCapturing) return;
 
-    this.recorder.stop();
     this.isCapturing = false;
 
+    // 停止定时器
+    if (this._timerId) {
+      clearInterval(this._timerId);
+      this._timerId = null;
+    }
+
+    // 发送剩余数据
+    if (this._pcmBuffer.length > 0) {
+      await this._sendChunk();
+    }
+
+    // 通知后端结束
+    try {
+      await fetch(this.uploadUrl + '?end=1&session=' + this._sessionId, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: new ArrayBuffer(0),
+      });
+    } catch (e) {
+      console.warn('AudioCapture: 发送结束标志失败', e.message);
+    }
+
+    // 清理音频资源
+    if (this.processor) {
+      this.processor.disconnect();
+      this.processor = null;
+    }
+    if (this.audioCtx) {
+      this.audioCtx.close();
+      this.audioCtx = null;
+    }
     if (this.stream) {
-      this.stream.getTracks().forEach(track => track.stop());
+      this.stream.getTracks().forEach(t => t.stop());
       this.stream = null;
     }
 
@@ -125,24 +155,24 @@ class AudioCapture {
   }
 
   /**
-   * 上传音频分片
+   * 发送 PCM 分片到后端
    */
-  async _uploadChunk(blob) {
-    const formData = new FormData();
-    formData.append('audio', blob, 'chunk.webm');
-    formData.append('mime', this.recorder.mimeType);
+  async _sendChunk() {
+    if (this._pcmBuffer.length === 0) return;
 
-    this.callbacks.onChunk(blob);
+    // 取出缓冲区数据
+    const pcmData = new Int16Array(this._pcmBuffer);
+    this._pcmBuffer = [];
 
     try {
-      const resp = await fetch(this.uploadUrl, {
+      const resp = await fetch(this.uploadUrl + '?session=' + this._sessionId, {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: pcmData.buffer,
       });
 
       if (resp.ok) {
         const data = await resp.json().catch(() => ({}));
-        // 如果后端返回了识别文字
         if (data.text && data.text.trim()) {
           this.callbacks.onText({
             text: data.text.trim(),
@@ -152,31 +182,23 @@ class AudioCapture {
         }
       }
     } catch (e) {
-      // 静默处理上传失败（下一个分片继续）
       console.warn('AudioCapture: 分片上传失败', e.message);
     }
   }
 
   /**
-   * 选择浏览器支持的音频编码格式
+   * Float32 → Int16 转换
    */
-  _pickMimeType() {
-    const types = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/ogg;codecs=opus',
-      'audio/mp4',
-    ];
-    for (const t of types) {
-      if (MediaRecorder.isTypeSupported(t)) {
-        return t;
-      }
+  _float32ToInt16(float32) {
+    const int16 = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
-    return 'audio/webm';  // 兜底
+    return int16;
   }
 }
 
-// 挂全局
 if (typeof window !== 'undefined') {
   window.AudioCapture = AudioCapture;
 }

@@ -11,8 +11,11 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 #include "nlohmann/json.hpp"
+#include "speech_recognizer.h"
 
 #include <cctype>
+#include <map>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +32,17 @@ namespace fs = std::filesystem;
 static std::string g_deepseekKey;
 static std::string g_zhipuKey;
 static std::string g_dashscopeKey;
+static XfyunConfig g_xfyunCfg;
+
+// 讯飞会话
+struct XfyunSess {
+    std::unique_ptr<SpeechRecognizer> reco;
+    std::string text;
+    bool connected = false;
+    bool ended = false;
+};
+static std::map<std::string, XfyunSess> g_sessions;
+static std::mutex g_sessMutex;
 
 static void initApiKeys() {
     std::ifstream f(".env");
@@ -49,6 +63,9 @@ static void initApiKeys() {
         if (k == "DEEPSEEK_API_KEY")   g_deepseekKey = v;
         if (k == "ZHIPU_API_KEY")      g_zhipuKey = v;
         if (k == "DASHSCOPE_API_KEY")  g_dashscopeKey = v;
+        if (k == "XFYUN_APP_ID")        g_xfyunCfg.appId = v;
+        if (k == "XFYUN_API_KEY")       g_xfyunCfg.apiKey = v;
+        if (k == "XFYUN_API_SECRET")    g_xfyunCfg.apiSecret = v;
     }
 }
 
@@ -111,9 +128,8 @@ static const char* PARSE_SYSTEM_PROMPT =
 int main() {
     initApiKeys();
     std::cout << "[INFO] DeepSeek: " << (g_deepseekKey.empty() ? "NOT FOUND" : "loaded")
-              << "  DashScope: " << (g_dashscopeKey.empty() ? "NOT FOUND" : "loaded") << std::endl;
-    if (g_deepseekKey.empty())  std::cerr << "Set DEEPSEEK_API_KEY in .env" << std::endl;
-    if (g_dashscopeKey.empty()) std::cerr << "Set DASHSCOPE_API_KEY in .env" << std::endl;
+              << "  DashScope: " << (g_dashscopeKey.empty() ? "NOT FOUND" : "loaded")
+              << "  Xfyun: " << (g_xfyunCfg.isValid() ? "loaded" : "NOT FOUND") << std::endl;
 
     // 创建 generated 目录（图片输出）
     fs::create_directory("generated");
@@ -319,6 +335,82 @@ int main() {
         out["prompt"]    = prompt;
         res.set_content(out.dump(), "application/json");
         std::cout << "[GENERATE] " << localPath << std::endl;
+    });
+
+    // ---- POST /api/speech (音频分片 → 讯飞转写) ---------------------
+    svr.Post("/api/speech", [](const httplib::Request& req, httplib::Response& res) {
+        std::string sid = req.has_param("session") ? req.get_param_value("session") : "default";
+
+        // 检查是否结束标志
+        bool endFlag = req.has_param("end") && req.get_param_value("end") == "1";
+
+        std::lock_guard<std::mutex> lk(g_sessMutex);
+        auto& sess = g_sessions[sid];
+
+        if (endFlag) {
+            // 结束请求: 发送讯飞 end frame，返回最终文字
+            std::string finalText = sess.text;
+            if (sess.reco && sess.connected && !sess.ended) {
+                sess.reco->sendEnd();
+                sess.ended = true;
+            }
+            json out;
+            out["text"] = finalText;
+            out["isFinal"] = true;
+            out["confidence"] = 0.9;
+            res.set_content(out.dump(), "application/json");
+            // 清理
+            if (sess.reco) sess.reco->disconnect();
+            g_sessions.erase(sid);
+            std::cout << "[SPEECH] session " << sid << " ended. final: " << finalText << std::endl;
+            return;
+        }
+
+        // 新会话: 建立讯飞连接
+        if (!sess.connected && g_xfyunCfg.isValid()) {
+            sess.reco = std::make_unique<SpeechRecognizer>(g_xfyunCfg);
+            sess.reco->setOnText([&sess](const std::string& t, bool final, double conf) {
+                sess.text += t;
+            });
+            sess.connected = sess.reco->connect();
+        }
+
+        // 发送音频（raw PCM binary body）
+        if (sess.reco && sess.connected && !sess.ended) {
+            std::vector<uint8_t> pcm(req.body.begin(), req.body.end());
+            if (!pcm.empty()) {
+                sess.reco->sendAudio(pcm);
+            }
+        }
+
+        json out;
+        out["text"] = sess.text;
+        out["isFinal"] = false;
+        out["confidence"] = 0.0;
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // ---- POST /api/speech/stop (终止会话) ---------------------------
+    svr.Post("/api/speech/stop", [](const httplib::Request& req, httplib::Response& res) {
+        std::string sid = req.has_param("session") ? req.get_param_value("session") : "default";
+        std::lock_guard<std::mutex> lk(g_sessMutex);
+        auto it = g_sessions.find(sid);
+        json out;
+        if (it != g_sessions.end()) {
+            auto& sess = it->second;
+            if (sess.reco && sess.connected && !sess.ended) {
+                sess.reco->sendEnd();
+                sess.ended = true;
+            }
+            out["text"] = sess.text;
+            out["isFinal"] = true;
+            if (sess.reco) sess.reco->disconnect();
+            g_sessions.erase(it);
+        } else {
+            out["text"] = "";
+            out["isFinal"] = true;
+        }
+        res.set_content(out.dump(), "application/json");
     });
 
     std::cout << "=== AI Voice Drawing Backend :" << port << " ===" << std::endl;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(voice-drawing-backend VERSION 0.1.0 LANGUAGES CXX)
+project(voice-drawing-backend VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,7 +10,7 @@ if(MSVC)
 endif()
 
 # ============================================================
-# OpenSSL
+# OpenSSL (httplib HTTPS + 讯飞鉴权 HMAC-SHA256)
 # ============================================================
 find_package(OpenSSL REQUIRED)
 
@@ -25,11 +25,29 @@ add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 # ============================================================
+# ixwebsocket (本地源码 ixwebsocket_src/)
+# ============================================================
+set(USE_TLS ON CACHE BOOL "" FORCE)
+add_subdirectory(ixwebsocket_src)
+
+# ============================================================
 # 可执行文件
 # ============================================================
-add_executable(server server.cpp)
+add_executable(server
+    server.cpp
+    speech_recognizer.h
+    speech_recognizer.cpp
+)
 
-target_link_libraries(server PRIVATE httplib nlohmann_json OpenSSL::SSL OpenSSL::Crypto)
+target_include_directories(server PRIVATE ${CMAKE_SOURCE_DIR}/ixwebsocket_src/ixwebsocket)
+
+target_link_libraries(server PRIVATE
+    httplib
+    nlohmann_json
+    ixwebsocket
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
 
 if(WIN32)
     target_link_libraries(server PRIVATE ws2_32)
