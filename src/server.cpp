@@ -65,6 +65,112 @@ struct HistoryItem {
 static std::vector<HistoryItem> g_history;
 static std::mutex g_histMutex;
 
+// ===== 聊天会话 =====
+struct ChatMessage {
+    std::string role;       // "user" | "ai"
+    std::string type;       // "text" | "image"
+    std::string text;
+    std::string imageUrl;
+    std::string localPath;
+    std::string timestamp;
+};
+
+struct ChatSession {
+    std::string id;
+    std::string username;   // 所属用户
+    std::string title;      // 会话标题（取第一条消息）
+    std::string preview;    // 最近一条消息摘要
+    std::string createdAt;
+    std::string updatedAt;
+    std::vector<ChatMessage> messages;
+};
+
+static std::vector<ChatSession> g_chatSessions;
+static std::mutex g_sessStoreMutex;
+static const std::string SESSIONS_FILE = "sessions.json";
+
+static void loadSessions() {
+    std::ifstream f(SESSIONS_FILE);
+    if (!f) return;
+    try {
+        json arr = json::parse(f);
+        for (auto& item : arr) {
+            ChatSession s;
+            s.id = item.value("id", "");
+            s.username = item.value("username", "");
+            s.title = item.value("title", "");
+            s.preview = item.value("preview", "");
+            s.createdAt = item.value("createdAt", "");
+            s.updatedAt = item.value("updatedAt", "");
+            if (item.contains("messages") && item["messages"].is_array()) {
+                for (auto& m : item["messages"]) {
+                    ChatMessage msg;
+                    msg.role = m.value("role", "");
+                    msg.type = m.value("type", "text");
+                    msg.text = m.value("text", "");
+                    msg.imageUrl = m.value("imageUrl", "");
+                    msg.localPath = m.value("localPath", "");
+                    msg.timestamp = m.value("timestamp", "");
+                    s.messages.push_back(msg);
+                }
+            }
+            if (!s.id.empty()) g_chatSessions.push_back(s);
+        }
+    } catch (...) {}
+}
+
+static void saveSessions() {
+    json arr = json::array();
+    for (auto& s : g_chatSessions) {
+        json j;
+        j["id"] = s.id;
+        j["username"] = s.username;
+        j["title"] = s.title;
+        j["preview"] = s.preview;
+        j["createdAt"] = s.createdAt;
+        j["updatedAt"] = s.updatedAt;
+        j["messages"] = json::array();
+        for (auto& m : s.messages) {
+            j["messages"].push_back({
+                {"role", m.role}, {"type", m.type}, {"text", m.text},
+                {"imageUrl", m.imageUrl}, {"localPath", m.localPath},
+                {"timestamp", m.timestamp}
+            });
+        }
+        arr.push_back(j);
+    }
+    std::ofstream(SESSIONS_FILE) << arr.dump(2);
+}
+
+static std::string currentTimeStr() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    char ts[32];
+#ifdef _WIN32
+    struct tm ltm; localtime_s(&ltm, &t);
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &ltm);
+#else
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+#endif
+    return std::string(ts);
+}
+
+// UTF-8 安全截断：按字符数截断，不会截断多字节字符
+static std::string utf8Substr(const std::string& str, size_t maxChars) {
+    size_t charCount = 0;
+    size_t bytePos = 0;
+    while (bytePos < str.size() && charCount < maxChars) {
+        unsigned char c = str[bytePos];
+        if (c < 0x80) bytePos += 1;        // ASCII
+        else if ((c & 0xE0) == 0xC0) bytePos += 2;  // 2字节
+        else if ((c & 0xF0) == 0xE0) bytePos += 3;  // 3字节
+        else if ((c & 0xF8) == 0xF0) bytePos += 4;  // 4字节
+        else bytePos += 1;  // 无效字节，跳过
+        charCount++;
+    }
+    return str.substr(0, bytePos);
+}
+
 // ===== 用户认证 =====
 struct User {
     std::string username;
@@ -248,6 +354,7 @@ static const char* PARSE_SYSTEM_PROMPT =
 int main() {
     initApiKeys();
     loadUsers();
+    loadSessions();
 
     // 全局初始化 libcurl（必须在多线程使用前调用一次）
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -916,6 +1023,185 @@ int main() {
         out["nickname"] = nickname;
         out["createdAt"] = createdAt;
         res.set_content(out.dump(), "application/json");
+    });
+
+    // ===== 聊天会话 API =====
+
+    // ---- GET /api/sessions (获取当前用户的会话列表) ----
+    svr.Get("/api/sessions", [](const httplib::Request& req, httplib::Response& res) {
+        std::string username = getCurrentUser(req);
+        if (username.empty()) {
+            res.status = 401;
+            res.set_content("{\"error\":\"未登录\"}", "application/json");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g_sessStoreMutex);
+        json arr = json::array();
+        for (auto& s : g_chatSessions) {
+            if (s.username != username) continue;
+            json j;
+            j["id"] = s.id;
+            j["title"] = s.title;
+            j["preview"] = s.preview;
+            j["createdAt"] = s.createdAt;
+            j["updatedAt"] = s.updatedAt;
+            j["messageCount"] = s.messages.size();
+            arr.push_back(j);
+        }
+        res.set_content(arr.dump(), "application/json");
+    });
+
+    // ---- POST /api/sessions (创建新会话) ----
+    svr.Post("/api/sessions", [](const httplib::Request& req, httplib::Response& res) {
+        try {
+        std::string username = getCurrentUser(req);
+        if (username.empty()) {
+            res.status = 401;
+            res.set_content("{\"error\":\"未登录\"}", "application/json");
+            return;
+        }
+        json body;
+        if (!req.body.empty()) {
+            try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+        }
+
+        ChatSession s;
+        s.id = generateToken().substr(0, 16);
+        s.username = username;
+        s.title = body.value("title", "新对话");
+        s.preview = "";
+        s.createdAt = currentTimeStr();
+        s.updatedAt = s.createdAt;
+
+        {
+            std::lock_guard<std::mutex> lk(g_sessStoreMutex);
+            g_chatSessions.insert(g_chatSessions.begin(), s);
+            saveSessions();
+        }
+
+        json out;
+        out["id"] = s.id;
+        out["title"] = s.title;
+        out["createdAt"] = s.createdAt;
+        res.set_content(out.dump(), "application/json");
+        std::cout << "[SESSION] 创建: " << s.id << " user=" << username << std::endl;
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content("{\"error\":\"" + std::string(e.what()) + "\"}", "application/json");
+            std::cerr << "[SESSION] 创建失败: " << e.what() << std::endl;
+        }
+    });
+
+    // ---- GET /api/sessions/:id (获取会话详情+消息) ----
+    svr.Get(R"(/api/sessions/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+        std::string username = getCurrentUser(req);
+        if (username.empty()) {
+            res.status = 401;
+            res.set_content("{\"error\":\"未登录\"}", "application/json");
+            return;
+        }
+        std::string sid = req.matches[1];
+        std::lock_guard<std::mutex> lk(g_sessStoreMutex);
+        for (auto& s : g_chatSessions) {
+            if (s.id == sid && s.username == username) {
+                json j;
+                j["id"] = s.id;
+                j["title"] = s.title;
+                j["preview"] = s.preview;
+                j["createdAt"] = s.createdAt;
+                j["updatedAt"] = s.updatedAt;
+                j["messages"] = json::array();
+                for (auto& m : s.messages) {
+                    j["messages"].push_back({
+                        {"role", m.role}, {"type", m.type}, {"text", m.text},
+                        {"imageUrl", m.imageUrl}, {"localPath", m.localPath},
+                        {"timestamp", m.timestamp}
+                    });
+                }
+                res.set_content(j.dump(), "application/json");
+                return;
+            }
+        }
+        res.status = 404;
+        res.set_content("{\"error\":\"会话不存在\"}", "application/json");
+    });
+
+    // ---- POST /api/sessions/:id/messages (向会话添加消息) ----
+    svr.Post(R"(/api/sessions/([^/]+)/messages)", [](const httplib::Request& req, httplib::Response& res) {
+        try {
+        std::string username = getCurrentUser(req);
+        if (username.empty()) {
+            res.status = 401;
+            res.set_content("{\"error\":\"未登录\"}", "application/json");
+            return;
+        }
+        std::string sid = req.matches[1];
+        json body;
+        if (!req.body.empty()) {
+            try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+        }
+
+        ChatMessage msg;
+        msg.role = body.value("role", "user");
+        msg.type = body.value("type", "text");
+        msg.text = body.value("text", "");
+        msg.imageUrl = body.value("imageUrl", "");
+        msg.localPath = body.value("localPath", "");
+        msg.timestamp = currentTimeStr();
+
+        {
+            std::lock_guard<std::mutex> lk(g_sessStoreMutex);
+            for (auto& s : g_chatSessions) {
+                if (s.id == sid && s.username == username) {
+                    s.messages.push_back(msg);
+                    s.updatedAt = msg.timestamp;
+                    // 更新标题和预览
+                    if (s.messages.size() == 1 && msg.role == "user") {
+                        s.title = utf8Substr(msg.text, 20);
+                    }
+                    s.preview = utf8Substr(msg.text, 30);
+                    if (msg.type == "image") s.preview = "🖼 " + s.preview;
+                    saveSessions();
+                    json out;
+                    out["success"] = true;
+                    out["timestamp"] = msg.timestamp;
+                    res.set_content(out.dump(), "application/json");
+                    return;
+                }
+            }
+        }
+        res.status = 404;
+        res.set_content("{\"error\":\"会话不存在\"}", "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content("{\"error\":\"" + std::string(e.what()) + "\"}", "application/json");
+            std::cerr << "[SESSION] 添加消息失败: " << e.what() << std::endl;
+        }
+    });
+
+    // ---- DELETE /api/sessions/:id (删除会话) ----
+    svr.Delete(R"(/api/sessions/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
+        std::string username = getCurrentUser(req);
+        if (username.empty()) {
+            res.status = 401;
+            res.set_content("{\"error\":\"未登录\"}", "application/json");
+            return;
+        }
+        std::string sid = req.matches[1];
+        {
+            std::lock_guard<std::mutex> lk(g_sessStoreMutex);
+            for (auto it = g_chatSessions.begin(); it != g_chatSessions.end(); ++it) {
+                if (it->id == sid && it->username == username) {
+                    g_chatSessions.erase(it);
+                    saveSessions();
+                    res.set_content("{\"success\":true}", "application/json");
+                    std::cout << "[SESSION] 删除: " << sid << std::endl;
+                    return;
+                }
+            }
+        }
+        res.status = 404;
+        res.set_content("{\"error\":\"会话不存在\"}", "application/json");
     });
 
     std::cout << "=== AI Voice Drawing Backend :" << port << " ===" << std::endl;
