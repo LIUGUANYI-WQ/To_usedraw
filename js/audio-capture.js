@@ -42,6 +42,9 @@ class AudioCapture {
     /** 会话 ID */
     this._sessionId = 'sess_' + Date.now();
 
+    /** 是否已收到最终结果（防止重复触发） */
+    this._gotFinal = false;
+
     /** 事件回调 */
     this.callbacks = {
       onStart:  options.onStart  || (() => {}),
@@ -158,11 +161,22 @@ class AudioCapture {
 
     // 通知后端结束
     try {
-      await fetch(this.uploadUrl + '?end=1&session=' + this._sessionId, {
+      const resp = await fetch(this.uploadUrl + '?end=1&session=' + this._sessionId, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: new ArrayBuffer(0),
       });
+      // 处理结束请求的响应，获取最终文本（如果之前没收到 isFinal）
+      if (resp.ok && !this._gotFinal) {
+        const data = await resp.json().catch(() => ({}));
+        if (data.text && data.text.trim()) {
+          this.callbacks.onText({
+            text: data.text.trim(),
+            isFinal: true,
+            confidence: data.confidence || 0.9,
+          });
+        }
+      }
     } catch (e) {
       console.warn('AudioCapture: 发送结束标志失败', e.message);
     }
@@ -209,6 +223,7 @@ class AudioCapture {
       if (resp.ok) {
         const data = await resp.json().catch(() => ({}));
         if (data.text && data.text.trim()) {
+          if (data.isFinal) this._gotFinal = true;
           this.callbacks.onText({
             text: data.text.trim(),
             isFinal: data.isFinal || false,
