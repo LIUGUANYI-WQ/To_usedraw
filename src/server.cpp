@@ -27,6 +27,9 @@
 #include <string>
 #include <thread>
 #include <filesystem>
+#include <random>
+#include <sstream>
+#include <iomanip>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -61,6 +64,103 @@ struct HistoryItem {
 };
 static std::vector<HistoryItem> g_history;
 static std::mutex g_histMutex;
+
+// ===== 用户认证 =====
+struct User {
+    std::string username;
+    std::string passwordHash;  // 简单 SHA-256
+    std::string nickname;
+    std::string createdAt;
+};
+
+struct Session {
+    std::string token;
+    std::string username;
+    std::chrono::system_clock::time_point expires;
+};
+
+static std::vector<User> g_users;
+static std::map<std::string, Session> g_sessions;  // token -> session
+static std::mutex g_authMutex;
+static const std::string USERS_FILE = "users.json";
+
+// 简单 SHA-256 (使用 OpenSSL)
+static std::string sha256(const std::string& input) {
+    unsigned char hash[32];
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
+    EVP_DigestUpdate(ctx, input.c_str(), input.size());
+    EVP_DigestFinal_ex(ctx, hash, nullptr);
+    EVP_MD_CTX_free(ctx);
+    std::ostringstream oss;
+    for (int i = 0; i < 32; i++) oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    return oss.str();
+}
+
+// 生成随机 token
+static std::string generateToken() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+    std::ostringstream oss;
+    for (int i = 0; i < 32; i++) oss << std::hex << std::setw(2) << std::setfill('0') << dis(gen);
+    return oss.str();
+}
+
+// 加载用户数据
+static void loadUsers() {
+    std::ifstream f(USERS_FILE);
+    if (!f) return;
+    try {
+        json arr = json::parse(f);
+        for (auto& item : arr) {
+            User u;
+            u.username = item.value("username", "");
+            u.passwordHash = item.value("passwordHash", "");
+            u.nickname = item.value("nickname", "");
+            u.createdAt = item.value("createdAt", "");
+            if (!u.username.empty()) g_users.push_back(u);
+        }
+    } catch (...) {}
+}
+
+// 保存用户数据
+static void saveUsers() {
+    json arr = json::array();
+    for (auto& u : g_users) {
+        arr.push_back({{"username", u.username}, {"passwordHash", u.passwordHash},
+                       {"nickname", u.nickname}, {"createdAt", u.createdAt}});
+    }
+    std::ofstream(USERS_FILE) << arr.dump(2);
+}
+
+// 从请求中获取当前用户（通过 Cookie 或 Authorization header）
+static std::string getCurrentUser(const httplib::Request& req) {
+    // 1. Authorization: Bearer xxx
+    std::string authHeader = req.get_header_value("Authorization");
+    if (!authHeader.empty() && authHeader.substr(0, 7) == "Bearer ") {
+        std::string token = authHeader.substr(7);
+        std::lock_guard<std::mutex> lk(g_authMutex);
+        auto it = g_sessions.find(token);
+        if (it != g_sessions.end() && it->second.expires > std::chrono::system_clock::now()) {
+            return it->second.username;
+        }
+    }
+    // 2. Cookie: token=xxx
+    std::string cookie = req.get_header_value("Cookie");
+    auto pos = cookie.find("token=");
+    if (pos != std::string::npos) {
+        auto start = pos + 6;
+        auto end = cookie.find(';', start);
+        std::string token = cookie.substr(start, end - start);
+        std::lock_guard<std::mutex> lk(g_authMutex);
+        auto it = g_sessions.find(token);
+        if (it != g_sessions.end() && it->second.expires > std::chrono::system_clock::now()) {
+            return it->second.username;
+        }
+    }
+    return "";
+}
 
 static void initApiKeys() {
     std::ifstream f(".env");
@@ -147,6 +247,7 @@ static const char* PARSE_SYSTEM_PROMPT =
 // ===== main =====
 int main() {
     initApiKeys();
+    loadUsers();
 
     // 全局初始化 libcurl（必须在多线程使用前调用一次）
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -663,6 +764,157 @@ int main() {
             out["text"] = "";
             out["isFinal"] = true;
         }
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // ===== 认证 API =====
+
+    // ---- POST /api/register (注册) ----
+    svr.Post("/api/register", [](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid JSON\"}", "application/json");
+            return;
+        }
+        std::string username = body.value("username", "");
+        std::string password = body.value("password", "");
+        std::string nickname = body.value("nickname", username);
+        if (username.empty() || password.empty() || username.size() < 2 || password.size() < 4) {
+            res.status = 400;
+            res.set_content("{\"error\":\"用户名至少2字符，密码至少4字符\"}", "application/json");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_authMutex);
+            for (auto& u : g_users) {
+                if (u.username == username) {
+                    res.status = 409;
+                    res.set_content("{\"error\":\"用户名已存在\"}", "application/json");
+                    return;
+                }
+            }
+            User u;
+            u.username = username;
+            u.passwordHash = sha256(password);
+            u.nickname = nickname;
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            char ts[32];
+#ifdef _WIN32
+            struct tm ltm; localtime_s(&ltm, &t);
+            std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &ltm);
+#else
+            std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+#endif
+            u.createdAt = ts;
+            g_users.push_back(u);
+            saveUsers();
+        }
+        json out;
+        out["success"] = true;
+        out["username"] = username;
+        res.set_content(out.dump(), "application/json");
+        std::cout << "[AUTH] 注册: " << username << std::endl;
+    });
+
+    // ---- POST /api/login (登录) ----
+    svr.Post("/api/login", [](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid JSON\"}", "application/json");
+            return;
+        }
+        std::string username = body.value("username", "");
+        std::string password = body.value("password", "");
+        std::string hash = sha256(password);
+        std::string token;
+        std::string nickname;
+        {
+            std::lock_guard<std::mutex> lk(g_authMutex);
+            bool found = false;
+            for (auto& u : g_users) {
+                if (u.username == username && u.passwordHash == hash) {
+                    found = true;
+                    nickname = u.nickname;
+                    break;
+                }
+            }
+            if (!found) {
+                res.status = 401;
+                res.set_content("{\"error\":\"用户名或密码错误\"}", "application/json");
+                return;
+            }
+            token = generateToken();
+            Session sess;
+            sess.token = token;
+            sess.username = username;
+            sess.expires = std::chrono::system_clock::now() + std::chrono::hours(24);
+            g_sessions[token] = sess;
+        }
+        // 设置 Cookie
+        res.set_header("Set-Cookie", "token=" + token + "; Path=/; Max-Age=86400; HttpOnly");
+        json out;
+        out["success"] = true;
+        out["token"] = token;
+        out["username"] = username;
+        out["nickname"] = nickname;
+        res.set_content(out.dump(), "application/json");
+        std::cout << "[AUTH] 登录: " << username << std::endl;
+    });
+
+    // ---- POST /api/logout (退出) ----
+    svr.Post("/api/logout", [](const httplib::Request& req, httplib::Response& res) {
+        std::string username = getCurrentUser(req);
+        if (!username.empty()) {
+            // 删除 session
+            std::string authHeader = req.get_header_value("Authorization");
+            std::string cookie = req.get_header_value("Cookie");
+            std::string token;
+            if (!authHeader.empty() && authHeader.substr(0, 7) == "Bearer ") {
+                token = authHeader.substr(7);
+            } else {
+                auto pos = cookie.find("token=");
+                if (pos != std::string::npos) {
+                    auto start = pos + 6;
+                    auto end = cookie.find(';', start);
+                    token = cookie.substr(start, end - start);
+                }
+            }
+            if (!token.empty()) {
+                std::lock_guard<std::mutex> lk(g_authMutex);
+                g_sessions.erase(token);
+            }
+        }
+        res.set_header("Set-Cookie", "token=; Path=/; Max-Age=0; HttpOnly");
+        res.set_content("{\"success\":true}", "application/json");
+    });
+
+    // ---- GET /api/me (获取当前用户信息) ----
+    svr.Get("/api/me", [](const httplib::Request& req, httplib::Response& res) {
+        std::string username = getCurrentUser(req);
+        if (username.empty()) {
+            res.status = 401;
+            res.set_content("{\"error\":\"未登录\"}", "application/json");
+            return;
+        }
+        std::string nickname;
+        std::string createdAt;
+        {
+            std::lock_guard<std::mutex> lk(g_authMutex);
+            for (auto& u : g_users) {
+                if (u.username == username) {
+                    nickname = u.nickname;
+                    createdAt = u.createdAt;
+                    break;
+                }
+            }
+        }
+        json out;
+        out["username"] = username;
+        out["nickname"] = nickname;
+        out["createdAt"] = createdAt;
         res.set_content(out.dump(), "application/json");
     });
 

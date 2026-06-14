@@ -13,6 +13,11 @@
     <header class="app-header">
       <h1 class="app-title">🎤 语音绘图工具</h1>
       <span class="header-hint">纯语音控制，无需鼠标键盘</span>
+      <div class="user-info" id="userInfo" style="display:none">
+        <div class="user-avatar" id="userAvatar"></div>
+        <span class="user-name" id="userName"></span>
+        <button class="logout-btn" id="logoutBtn">退出</button>
+      </div>
     </header>
 
     <!-- 画布区域 -->
@@ -92,6 +97,7 @@
     </section>
   </div>
 
+  <script src="js/auth-service.js"></script>
   <script src="js/audio-capture.js"></script>
   <script src="js/drawing-engine.js"></script>
   <script src="js/command-parser.js"></script>

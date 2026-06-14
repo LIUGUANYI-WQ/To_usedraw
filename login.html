@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - 语音绘图工具</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body class="login-body">
+
+  <div class="login-container">
+    <div class="login-card">
+      <div class="login-header">
+        <h1 class="login-title">语音绘图工具</h1>
+        <p class="login-subtitle">登录或注册以开始创作</p>
+      </div>
+
+      <!-- 登录/注册切换 -->
+      <div class="login-tabs">
+        <button class="login-tab login-tab--active" id="tabLogin" onclick="switchTab('login')">登录</button>
+        <button class="login-tab" id="tabRegister" onclick="switchTab('register')">注册</button>
+      </div>
+
+      <!-- 登录表单 -->
+      <form id="loginForm" class="login-form" onsubmit="handleLogin(event)">
+        <div class="form-group">
+          <label for="loginUsername">用户名</label>
+          <input type="text" id="loginUsername" placeholder="请输入用户名" required minlength="2" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="loginPassword">密码</label>
+          <input type="password" id="loginPassword" placeholder="请输入密码" required minlength="4" autocomplete="current-password">
+        </div>
+        <div class="form-error" id="loginError"></div>
+        <button type="submit" class="login-btn" id="loginBtn">登录</button>
+      </form>
+
+      <!-- 注册表单 -->
+      <form id="registerForm" class="login-form" style="display:none" onsubmit="handleRegister(event)">
+        <div class="form-group">
+          <label for="regUsername">用户名</label>
+          <input type="text" id="regUsername" placeholder="至少2个字符" required minlength="2" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="regNickname">昵称（可选）</label>
+          <input type="text" id="regNickname" placeholder="显示名称，不填则同用户名" autocomplete="nickname">
+        </div>
+        <div class="form-group">
+          <label for="regPassword">密码</label>
+          <input type="password" id="regPassword" placeholder="至少4个字符" required minlength="4" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label for="regPassword2">确认密码</label>
+          <input type="password" id="regPassword2" placeholder="再次输入密码" required minlength="4" autocomplete="new-password">
+        </div>
+        <div class="form-error" id="registerError"></div>
+        <button type="submit" class="login-btn" id="registerBtn">注册</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    // 切换登录/注册标签
+    function switchTab(tab) {
+      const tabLogin = document.getElementById('tabLogin');
+      const tabRegister = document.getElementById('tabRegister');
+      const loginForm = document.getElementById('loginForm');
+      const registerForm = document.getElementById('registerForm');
+
+      if (tab === 'login') {
+        tabLogin.classList.add('login-tab--active');
+        tabRegister.classList.remove('login-tab--active');
+        loginForm.style.display = '';
+        registerForm.style.display = 'none';
+      } else {
+        tabRegister.classList.add('login-tab--active');
+        tabLogin.classList.remove('login-tab--active');
+        registerForm.style.display = '';
+        loginForm.style.display = 'none';
+      }
+      // 清除错误
+      document.getElementById('loginError').textContent = '';
+      document.getElementById('registerError').textContent = '';
+    }
+
+    // 登录
+    async function handleLogin(e) {
+      e.preventDefault();
+      const btn = document.getElementById('loginBtn');
+      const errEl = document.getElementById('loginError');
+      errEl.textContent = '';
+      btn.disabled = true;
+      btn.textContent = '登录中...';
+
+      try {
+        const resp = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('loginUsername').value.trim(),
+            password: document.getElementById('loginPassword').value,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          errEl.textContent = data.error || '登录失败';
+          return;
+        }
+        // 登录成功，跳转主页
+        window.location.href = '/';
+      } catch (err) {
+        errEl.textContent = '网络错误，请重试';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '登录';
+      }
+    }
+
+    // 注册
+    async function handleRegister(e) {
+      e.preventDefault();
+      const btn = document.getElementById('registerBtn');
+      const errEl = document.getElementById('registerError');
+      errEl.textContent = '';
+
+      const password = document.getElementById('regPassword').value;
+      const password2 = document.getElementById('regPassword2').value;
+      if (password !== password2) {
+        errEl.textContent = '两次密码不一致';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = '注册中...';
+
+      try {
+        const resp = await fetch('/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('regUsername').value.trim(),
+            password: password,
+            nickname: document.getElementById('regNickname').value.trim(),
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          errEl.textContent = data.error || '注册失败';
+          return;
+        }
+        // 注册成功，自动切换到登录
+        switchTab('login');
+        document.getElementById('loginUsername').value = document.getElementById('regUsername').value.trim();
+        document.getElementById('loginPassword').focus();
+        document.getElementById('loginError').textContent = '注册成功，请登录';
+        document.getElementById('loginError').style.color = 'var(--color-success)';
+      } catch (err) {
+        errEl.textContent = '网络错误，请重试';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '注册';
+      }
+    }
+
+    // 检查是否已登录
+    fetch('/api/me').then(r => {
+      if (r.ok) window.location.href = '/';
+    });
+  </script>
+</body>
+</html>
