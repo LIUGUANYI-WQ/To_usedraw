@@ -452,6 +452,22 @@ int main() {
             }
         }
 
+        // 检测讯飞连接是否已断开（VAD 静音自动关闭）
+        // 如果断开了且有文字，自动标记为最终结果
+        if (sess.reco && !sess.connected && !sess.text.empty()) {
+            std::string finalText = sess.text;
+            if (sess.reco) sess.reco->disconnect();
+            g_sessions.erase(sid);
+
+            json out;
+            out["text"] = finalText;
+            out["isFinal"] = true;
+            out["confidence"] = 0.9;
+            res.set_content(out.dump(), "application/json");
+            std::cout << "[SPEECH] VAD auto-end session " << sid << ". final: " << finalText << std::endl;
+            return;
+        }
+
         json out;
         out["text"] = sess.text;
         out["isFinal"] = false;
