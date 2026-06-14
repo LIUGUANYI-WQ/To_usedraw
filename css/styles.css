@@ -127,6 +127,32 @@ body {
   background: var(--color-sidebar-active);
 }
 
+.session-delete-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s;
+  line-height: 1;
+}
+
+.session-item:hover .session-delete-btn {
+  display: flex;
+}
+
+.session-delete-btn:hover {
+  background: var(--color-danger);
+  color: #fff;
+}
+
 .session-icon {
   width: 36px;
   height: 36px;

@@ -1,5 +1,5 @@
 /**
- * 语音绘图工具 — 主入口（微信风格聊天界面）
+ * 语音绘图工具 — 主入口（微信风格聊天界面 + 多会话管理）
  */
 
 (function () {
@@ -34,6 +34,9 @@
   /** @type {LLMService} */
   let llmSvc = null;
 
+  /** @type {SessionService} */
+  let sessionSvc = null;
+
   /** @type {AudioCapture} */
   let audioCapture = null;
 
@@ -47,9 +50,6 @@
   let lastGenResult = null;
   let lastParseResult = null;
 
-  /** 历史记录缓存 */
-  let historyCache = [];
-
   /** 当前加载行（用于替换为图片） */
   let currentLoadingRow = null;
 
@@ -61,10 +61,12 @@
     chatEngine = new ChatEngine(chatMessages);
     parser = new CommandParser();
     llmSvc = new LLMService();
+    sessionSvc = new SessionService();
     window.chatEngine = chatEngine;
     window.parser = parser;
     window.llm = llmSvc;
-    console.log('ChatEngine + CommandParser + LLM 初始化完成');
+    window.sessionSvc = sessionSvc;
+    console.log('ChatEngine + CommandParser + LLM + SessionService 初始化完成');
     return true;
   }
 
@@ -72,13 +74,22 @@
   // 消息处理
   // ===========================
 
-  function processUserInput(text) {
+  async function processUserInput(text) {
     if (!text || !text.trim()) return;
     text = text.trim();
+
+    // 确保有活跃会话
+    const sessionId = await sessionSvc.ensureSession();
 
     // 显示用户消息
     const userName = document.getElementById('userName');
     chatEngine.addUserMessage(text, { avatar: userName ? userName.textContent.charAt(0) : '我' });
+
+    // 保存用户消息到后端
+    sessionSvc.addMessage(sessionId, { role: 'user', type: 'text', text: text });
+
+    // 更新侧边栏
+    renderSessionList();
 
     // 策略1: 正则优先
     const cmd = parser.parse(text);
@@ -100,17 +111,19 @@
           thinkingBubble.textContent = '抱歉，没有理解你的意思，请换种说法试试';
           statusDot.className = 'status-dot status-dot--idle';
           statusText.textContent = '等待中';
+          sessionSvc.addMessage(sessionId, { role: 'ai', type: 'text', text: '抱歉，没有理解你的意思' });
           return;
         }
 
         // 更新思考气泡为解析结果
         thinkingBubble.textContent = '正在生成: ' + (parseResult.correctedText || text);
 
-        return generateImage(parseResult, thinkingBubble);
+        return generateImage(parseResult, thinkingBubble, sessionId);
       }).catch(e => {
         thinkingBubble.textContent = '出错了: ' + e.message;
         statusDot.className = 'status-dot status-dot--idle';
         statusText.textContent = '等待中';
+        sessionSvc.addMessage(sessionId, { role: 'ai', type: 'text', text: '出错了: ' + e.message });
         console.error('AI 链路失败:', e);
       });
     }
@@ -130,7 +143,7 @@
   // 图片生成
   // ===========================
 
-  function generateImage(parseResult, thinkingBubble) {
+  function generateImage(parseResult, thinkingBubble, sessionId) {
     const modelSelect = document.getElementById('modelSelect');
     const selectedModel = modelSelect ? modelSelect.value : 'flux-schnell';
     const startTime = Date.now();
@@ -171,15 +184,28 @@
         lastGenResult = genResult;
         lastParseResult = parseResult;
 
+        // 保存 AI 图片消息到后端
+        if (sessionId) {
+          sessionSvc.addMessage(sessionId, {
+            role: 'ai',
+            type: 'image',
+            text: parseResult.correctedText || '',
+            imageUrl: genResult.imageUrl || '',
+            localPath: genResult.localPath || '',
+          });
+        }
+
         // 更新侧边栏
-        updateSessionPreview(parseResult.correctedText || '');
-        loadHistory();
+        renderSessionList();
       } else {
         if (currentLoadingRow) {
           chatEngine.replaceLoadingWithText(currentLoadingRow, '生成失败，请重试');
           currentLoadingRow = null;
         } else {
           chatEngine.addAIMessage('生成失败，请重试');
+        }
+        if (sessionId) {
+          sessionSvc.addMessage(sessionId, { role: 'ai', type: 'text', text: '生成失败，请重试' });
         }
       }
 
@@ -209,7 +235,7 @@
       finalProcessed = true;
 
       accumulatedText += text;
-      // 语音最终结果 → 当作用户输入处理
+      // 语音结束后自动发送
       processUserInput(accumulatedText);
       accumulatedText = '';
 
@@ -262,54 +288,126 @@
   }
 
   // ===========================
-  // 侧边栏
+  // 会话管理（侧边栏）
   // ===========================
 
-  function updateSessionPreview(text) {
-    chatHeaderTitle.textContent = text.slice(0, 20) || '新对话';
-
-    // 更新或创建侧边栏当前会话
-    let activeItem = sessionList.querySelector('.session-item--active');
-    if (!activeItem) {
-      activeItem = document.createElement('div');
-      activeItem.className = 'session-item session-item--active';
-      activeItem.innerHTML =
-        '<div class="session-icon">🎨</div>' +
-        '<div class="session-info">' +
-          '<div class="session-name">当前对话</div>' +
-          '<div class="session-preview"></div>' +
-        '</div>';
-      sessionList.prepend(activeItem);
-    }
-    const preview = activeItem.querySelector('.session-preview');
-    if (preview) preview.textContent = text.slice(0, 30);
-    const name = activeItem.querySelector('.session-name');
-    if (name && text) name.textContent = text.slice(0, 15);
-  }
-
-  async function loadHistory() {
+  /**
+   * 渲染侧边栏会话列表
+   */
+  async function renderSessionList() {
     try {
-      const resp = await fetch('/api/history');
-      if (!resp.ok) return;
-      historyCache = await resp.json();
+      const sessions = await sessionSvc.list();
+      sessionList.innerHTML = '';
+
+      for (const s of sessions) {
+        const item = document.createElement('div');
+        item.className = 'session-item' + (s.id === sessionSvc.currentSessionId ? ' session-item--active' : '');
+        item.dataset.sessionId = s.id;
+
+        item.innerHTML =
+          '<div class="session-icon">🎨</div>' +
+          '<div class="session-info">' +
+            '<div class="session-name">' + escapeHtml(s.title || '新对话') + '</div>' +
+            '<div class="session-preview">' + escapeHtml(s.preview || '') + '</div>' +
+          '</div>' +
+          '<button class="session-delete-btn" title="删除会话">&times;</button>';
+
+        // 点击切换会话
+        item.addEventListener('click', function (e) {
+          // 如果点击的是删除按钮，不切换
+          if (e.target.classList.contains('session-delete-btn')) return;
+          switchSession(s.id);
+        });
+
+        // 删除按钮
+        const deleteBtn = item.querySelector('.session-delete-btn');
+        deleteBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          deleteSession(s.id);
+        });
+
+        sessionList.appendChild(item);
+      }
     } catch (e) {
-      console.warn('加载历史失败:', e.message);
+      console.warn('渲染会话列表失败:', e.message);
     }
   }
 
-  function newChat() {
+  /**
+   * 切换到指定会话
+   */
+  async function switchSession(sessionId) {
+    if (sessionSvc.currentSessionId === sessionId) return;
+
+    try {
+      const session = await sessionSvc.get(sessionId);
+      sessionSvc.currentSessionId = sessionId;
+
+      // 清空聊天区并加载历史消息
+      chatEngine.clear();
+      chatHeaderTitle.textContent = session.title || '新对话';
+
+      if (session.messages && session.messages.length > 0) {
+        for (const msg of session.messages) {
+          if (msg.role === 'user') {
+            chatEngine.addUserMessage(msg.text);
+          } else if (msg.role === 'ai') {
+            if (msg.type === 'image' && (msg.imageUrl || msg.localPath)) {
+              chatEngine.addAIImage(msg.localPath || msg.imageUrl, msg.text);
+            } else {
+              chatEngine.addAIMessage(msg.text);
+            }
+          }
+        }
+      }
+
+      // 更新侧边栏高亮
+      renderSessionList();
+    } catch (e) {
+      console.error('切换会话失败:', e.message);
+    }
+  }
+
+  /**
+   * 删除会话
+   */
+  async function deleteSession(sessionId) {
+    if (!confirm('确定删除这个对话？')) return;
+
+    try {
+      await sessionSvc.delete(sessionId);
+
+      // 如果删除的是当前会话，清空聊天区
+      if (!sessionSvc.currentSessionId) {
+        chatEngine.clear();
+        chatHeaderTitle.textContent = '新对话';
+        lastGenResult = null;
+        lastParseResult = null;
+      }
+
+      renderSessionList();
+    } catch (e) {
+      console.error('删除会话失败:', e.message);
+    }
+  }
+
+  /**
+   * 新建对话
+   */
+  async function newChat() {
     chatEngine.clear();
     lastGenResult = null;
     lastParseResult = null;
     accumulatedText = '';
     finalProcessed = false;
     currentLoadingRow = null;
+    sessionSvc.currentSessionId = null;
     chatHeaderTitle.textContent = '新对话';
     textInput.value = '';
 
-    // 重置侧边栏
+    // 更新侧边栏（去掉高亮）
     const activeItem = sessionList.querySelector('.session-item--active');
-    if (activeItem) activeItem.remove();
+    if (activeItem) activeItem.classList.remove('session-item--active');
 
     console.log('[新对话] 已清空');
   }
@@ -344,6 +442,12 @@
     return true;
   }
 
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
   // ===========================
   // 事件绑定
   // ===========================
@@ -352,6 +456,15 @@
   micBtn.addEventListener('click', function () {
     if (isListening) stopListening();
     else startListening();
+  });
+
+  // 自动/手动发送切换
+  const autoSendToggle = document.getElementById('autoSendToggle');
+  const autoSendLabel = autoSendToggle.querySelector('.auto-send-label');
+  autoSendToggle.addEventListener('click', function () {
+    autoSendVoice = !autoSendVoice;
+    autoSendLabel.textContent = autoSendVoice ? '自动' : '手动';
+    autoSendToggle.classList.toggle('auto-send--manual', !autoSendVoice);
   });
 
   // 发送按钮
@@ -414,7 +527,7 @@
   // ===========================
 
   function bootstrap() {
-    console.log('语音绘图工具 — 启动（微信聊天模式）');
+    console.log('语音绘图工具 — 启动（微信聊天模式 + 多会话）');
 
     // 先检查登录
     initAuth();
@@ -426,8 +539,8 @@
 
     checkAudioSupport();
 
-    // 加载历史
-    loadHistory();
+    // 加载会话列表
+    renderSessionList();
 
     console.log('💡 点击麦克风语音输入，或在输入框打字后按回车');
   }

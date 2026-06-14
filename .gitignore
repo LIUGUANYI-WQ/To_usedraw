@@ -3,6 +3,7 @@
 
 # 用户数据
 users.json
+sessions.json
 
 # 第三方库源码
 ixwebsocket_src/
