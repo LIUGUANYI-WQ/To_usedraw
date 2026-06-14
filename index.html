@@ -3,98 +3,71 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🎤 语音绘图工具</title>
+  <title>语音绘图工具</title>
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
 
-  <div class="app-container">
-    <!-- 顶部标题栏 -->
-    <header class="app-header">
-      <h1 class="app-title">🎤 语音绘图工具</h1>
-      <span class="header-hint">纯语音控制，无需鼠标键盘</span>
-      <div class="user-info" id="userInfo" style="display:none">
-        <div class="user-avatar" id="userAvatar"></div>
-        <span class="user-name" id="userName"></span>
-        <button class="logout-btn" id="logoutBtn">退出</button>
+  <div class="app-layout">
+    <!-- 左侧边栏：会话列表 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <h2 class="sidebar-title">AI 绘图</h2>
+        <button class="sidebar-new-btn" id="newChatBtn" title="新建对话">+</button>
       </div>
-    </header>
+      <div class="sidebar-sessions" id="sessionList">
+        <!-- 动态填充 -->
+      </div>
+      <div class="sidebar-footer">
+        <div class="user-info" id="userInfo" style="display:none">
+          <div class="user-avatar" id="userAvatar"></div>
+          <span class="user-name" id="userName"></span>
+          <button class="logout-btn" id="logoutBtn">退出</button>
+        </div>
+      </div>
+    </aside>
 
-    <!-- 画布区域 -->
-    <main class="canvas-area">
-      <canvas
-        id="drawCanvas"
-        width="800"
-        height="500"
-        aria-label="绘图画布"
-        role="img"
-      ></canvas>
-      <img id="aiImage" class="ai-image" alt="AI 生成图片" style="display:none">
-      <div class="loading-overlay" id="loadingOverlay" style="display:none">
-        <div class="loading-spinner"></div>
-        <p class="loading-text" id="loadingText">生成中...</p>
-        <p class="loading-timer" id="loadingTimer"></p>
-      </div>
-      <p class="canvas-placeholder" id="canvasPlaceholder">
-        🎤 说出你想要的画面，AI 帮你画出来
-      </p>
+    <!-- 右侧主区域：聊天 -->
+    <main class="chat-main">
+      <!-- 顶部栏 -->
+      <header class="chat-header">
+        <button class="sidebar-toggle" id="sidebarToggle" title="切换侧边栏">☰</button>
+        <div class="chat-header-info">
+          <span class="chat-header-title" id="chatHeaderTitle">新对话</span>
+          <div class="model-selector">
+            <label for="modelSelect" class="model-label">模型</label>
+            <select id="modelSelect" class="model-select">
+              <option value="flux-schnell">FLUX.1-schnell (快速)</option>
+              <option value="kolors">Kolors (免费/中文)</option>
+            </select>
+          </div>
+        </div>
+        <div class="status-indicator" id="statusIndicator">
+          <span class="status-dot status-dot--idle" id="statusDot"></span>
+          <span class="status-text" id="statusText">等待中</span>
+        </div>
+      </header>
+
+      <!-- 聊天消息区域 -->
+      <section class="chat-messages" id="chatMessages">
+        <div class="chat-welcome" id="chatWelcome">
+          <div class="welcome-icon">🎨</div>
+          <h3>说出你想要的画面</h3>
+          <p>点击下方麦克风按钮，用语音描述你想生成的图片</p>
+        </div>
+      </section>
+
+      <!-- 底部输入栏 -->
+      <footer class="chat-input-bar">
+        <button id="micBtn" class="mic-btn mic-btn--idle" title="开始/停止监听">
+          <span class="mic-icon">🎤</span>
+        </button>
+        <div class="chat-input-wrapper">
+          <input type="text" id="textInput" class="chat-input" placeholder="输入文字或点击麦克风语音输入..." autocomplete="off">
+        </div>
+        <button id="sendBtn" class="send-btn" title="发送">➤</button>
+      </footer>
     </main>
-
-    <!-- 控制栏 -->
-    <section class="control-bar">
-      <button id="micBtn" class="mic-btn mic-btn--idle" title="开始/停止监听">
-        <span class="mic-icon">🎤</span>
-        <span class="mic-label" id="micLabel">开始监听</span>
-      </button>
-
-      <button id="newChatBtn" class="action-btn" title="新建对话">
-        <span>➕</span> 新对话
-      </button>
-
-      <button id="refineBtn" class="action-btn action-btn--accent" title="基于当前图片继续调整" style="display:none">
-        <span>🔄</span> 继续调整
-      </button>
-
-      <div class="model-selector">
-        <label for="modelSelect" class="model-label">模型</label>
-        <select id="modelSelect" class="model-select">
-          <option value="flux-schnell">FLUX.1-schnell (快速)</option>
-          <option value="kolors">Kolors (免费/中文)</option>
-        </select>
-      </div>
-
-      <div class="status-indicator" id="statusIndicator">
-        <span class="status-dot status-dot--idle" id="statusDot"></span>
-        <span class="status-text" id="statusText">等待中</span>
-      </div>
-    </section>
-
-    <!-- 识别结果展示 -->
-    <section class="transcript-area">
-      <div class="transcript-header">识别结果</div>
-      <div class="transcript-content" id="transcriptContent">
-        <span class="transcript-placeholder">语音识别内容将实时显示在这里...</span>
-      </div>
-      <div class="confidence-bar" id="confidenceBar" hidden>
-        <div class="confidence-fill" id="confidenceFill"></div>
-      </div>
-    </section>
-
-    <!-- 历史记录 -->
-    <section class="history-area" id="historyArea">
-      <div class="history-header">
-        <span>历史记录</span>
-        <button id="toggleHistoryBtn" class="toggle-btn">收起</button>
-      </div>
-      <div class="history-list" id="historyList">
-        <span class="history-placeholder">暂无历史记录</span>
-      </div>
-    </section>
-
-    <!-- 错误/不支持提示 -->
-    <section class="error-area" id="errorArea" hidden>
-      <p class="error-message" id="errorMessage"></p>
-    </section>
   </div>
 
   <script src="js/auth-service.js"></script>
@@ -102,6 +75,7 @@
   <script src="js/drawing-engine.js"></script>
   <script src="js/command-parser.js"></script>
   <script src="js/llm-service.js"></script>
+  <script src="js/chat-engine.js"></script>
   <script src="js/main.js"></script>
 </body>
 </html>
