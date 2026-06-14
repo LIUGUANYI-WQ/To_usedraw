@@ -1,10 +1,10 @@
 /**
  * AudioCapture — 音频采集与分片上传模块
- * 使用 Web Audio API 采集原始 PCM (16kHz/16bit/mono)，发二进制到后端 /api/speech
+ * 使用 Web Audio API + AudioWorklet 采集原始 PCM (16kHz/16bit/mono)，发二进制到后端 /api/speech
  *
  * 流程：
  *   1. getUserMedia 获取麦克风
- *   2. AudioContext + ScriptProcessor 采集 Float32 音频
+ *   2. AudioContext + AudioWorklet 采集 Float32 音频
  *   3. 重采样到 16kHz，转 Int16 PCM
  *   4. 每 400ms 发送一个 PCM 块到 /api/speech (binary POST)
  *   5. 停止时发 /api/speech?end=1 通知后端结束
@@ -27,8 +27,8 @@ class AudioCapture {
     /** @type {MediaStream|null} */
     this.stream = null;
 
-    /** @type {ScriptProcessorNode|null} */
-    this.processor = null;
+    /** @type {AudioWorkletNode|null} */
+    this.workletNode = null;
 
     /** 录制状态 */
     this.isCapturing = false;
@@ -41,6 +41,9 @@ class AudioCapture {
 
     /** 会话 ID */
     this._sessionId = 'sess_' + Date.now();
+
+    /** 是否已收到最终结果（防止重复触发） */
+    this._gotFinal = false;
 
     /** 事件回调 */
     this.callbacks = {
@@ -83,19 +86,28 @@ class AudioCapture {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     this.audioCtx = new AudioCtx({ sampleRate: this.targetSampleRate });
 
+    // 注册 AudioWorklet 处理器
+    try {
+      await this.audioCtx.audioWorklet.addModule('/js/pcm-processor.js');
+    } catch (e) {
+      console.error('AudioCapture: AudioWorklet 加载失败，回退到 ScriptProcessor', e);
+      // 回退到 ScriptProcessor（兼容旧浏览器）
+      this._startWithScriptProcessor();
+      return;
+    }
+
     const source = this.audioCtx.createMediaStreamSource(this.stream);
 
-    // ScriptProcessor 采集原始 PCM（4096 帧缓冲）
-    this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1);
-    this.processor.onaudioprocess = (e) => {
+    // AudioWorklet 采集原始 PCM
+    this.workletNode = new AudioWorkletNode(this.audioCtx, 'pcm-processor');
+    this.workletNode.port.onmessage = (e) => {
       if (!this.isCapturing) return;
-      const float32 = e.inputBuffer.getChannelData(0);
-      const int16 = this._float32ToInt16(float32);
+      const int16 = new Int16Array(e.data);
       this._pcmBuffer.push(...int16);
     };
 
-    source.connect(this.processor);
-    this.processor.connect(this.audioCtx.destination);
+    source.connect(this.workletNode);
+    this.workletNode.connect(this.audioCtx.destination);
 
     this.isCapturing = true;
     this.callbacks.onStart();
@@ -103,7 +115,29 @@ class AudioCapture {
     // 定时发送 PCM 分片
     this._timerId = setInterval(() => this._sendChunk(), this.chunkInterval);
 
-    console.log('AudioCapture: 开始采集, sampleRate=' + this.audioCtx.sampleRate);
+    console.log('AudioCapture: 开始采集(AudioWorklet), sampleRate=' + this.audioCtx.sampleRate);
+  }
+
+  /**
+   * ScriptProcessor 回退方案（兼容不支持 AudioWorklet 的浏览器）
+   */
+  _startWithScriptProcessor() {
+    const source = this.audioCtx.createMediaStreamSource(this.stream);
+    const processor = this.audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (!this.isCapturing) return;
+      const float32 = e.inputBuffer.getChannelData(0);
+      const int16 = this._float32ToInt16(float32);
+      this._pcmBuffer.push(...int16);
+    };
+    source.connect(processor);
+    processor.connect(this.audioCtx.destination);
+    this._processor = processor;
+
+    this.isCapturing = true;
+    this.callbacks.onStart();
+    this._timerId = setInterval(() => this._sendChunk(), this.chunkInterval);
+    console.log('AudioCapture: 开始采集(ScriptProcessor回退), sampleRate=' + this.audioCtx.sampleRate);
   }
 
   /**
@@ -127,19 +161,34 @@ class AudioCapture {
 
     // 通知后端结束
     try {
-      await fetch(this.uploadUrl + '?end=1&session=' + this._sessionId, {
+      const resp = await fetch(this.uploadUrl + '?end=1&session=' + this._sessionId, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: new ArrayBuffer(0),
       });
+      // 处理结束请求的响应，获取最终文本（如果之前没收到 isFinal）
+      if (resp.ok && !this._gotFinal) {
+        const data = await resp.json().catch(() => ({}));
+        if (data.text && data.text.trim()) {
+          this.callbacks.onText({
+            text: data.text.trim(),
+            isFinal: true,
+            confidence: data.confidence || 0.9,
+          });
+        }
+      }
     } catch (e) {
       console.warn('AudioCapture: 发送结束标志失败', e.message);
     }
 
     // 清理音频资源
-    if (this.processor) {
-      this.processor.disconnect();
-      this.processor = null;
+    if (this.workletNode) {
+      this.workletNode.disconnect();
+      this.workletNode = null;
+    }
+    if (this._processor) {
+      this._processor.disconnect();
+      this._processor = null;
     }
     if (this.audioCtx) {
       this.audioCtx.close();
@@ -174,6 +223,7 @@ class AudioCapture {
       if (resp.ok) {
         const data = await resp.json().catch(() => ({}));
         if (data.text && data.text.trim()) {
+          if (data.isFinal) this._gotFinal = true;
           this.callbacks.onText({
             text: data.text.trim(),
             isFinal: data.isFinal || false,
@@ -187,7 +237,7 @@ class AudioCapture {
   }
 
   /**
-   * Float32 → Int16 转换
+   * Float32 → Int16 转换（ScriptProcessor 回退用）
    */
   _float32ToInt16(float32) {
     const int16 = new Int16Array(float32.length);

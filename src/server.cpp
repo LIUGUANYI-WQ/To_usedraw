@@ -42,7 +42,7 @@ static XfyunConfig g_xfyunCfg;
 struct XfyunSess {
     std::unique_ptr<SpeechRecognizer> reco;
     std::string text;
-    bool connected = false;
+    bool initialized = false;  // 是否已尝试过建立连接
     bool ended = false;
 };
 static std::map<std::string, XfyunSess> g_sessions;
@@ -233,7 +233,69 @@ int main() {
         res.set_content(out.dump(), "application/json");
     });
 
-    // ---- POST /api/generate (DashScope Z-Image-Turbo) --------------------
+    // ---- POST /api/parse-stream (星火 Lite 流式 SSE → 优化 Prompt) ------
+    svr.Post("/api/parse-stream", [](const httplib::Request& req, httplib::Response& res) {
+        json reqBody;
+        try { reqBody = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid JSON\"}", "application/json");
+            return;
+        }
+
+        std::string text = reqBody.value("text", "");
+        if (text.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing text\"}", "application/json");
+            return;
+        }
+
+        if (g_sparkApiPassword.empty()) {
+            res.status = 500;
+            res.set_content("{\"error\":\"SPARK_API_PASSWORD not set\"}", "application/json");
+            return;
+        }
+
+        // 设置 SSE 响应头
+        res.set_header("Content-Type", "text/event-stream");
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+
+        // 流式调用星火，每个 chunk 通过 SSE 推送给前端
+        SparkClient spark(g_sparkApiPassword);
+        std::string prompt, negativePrompt;
+
+        bool ok = spark.optimizePromptStreaming(text,
+            [&res](const std::string& delta) {
+                // SSE 格式: data: {...}\n\n
+                json chunk;
+                chunk["type"] = "delta";
+                chunk["text"] = delta;
+                res.body += "data: " + chunk.dump() + "\n\n";
+            },
+            prompt, negativePrompt);
+
+        if (!ok) {
+            json errChunk;
+            errChunk["type"] = "error";
+            errChunk["error"] = "Spark API failed";
+            res.body += "data: " + errChunk.dump() + "\n\n";
+            return;
+        }
+
+        // 最终结果
+        json doneChunk;
+        doneChunk["type"] = "done";
+        doneChunk["englishPrompt"] = prompt;
+        doneChunk["negativePrompt"] = negativePrompt;
+        doneChunk["correctedText"] = text;
+        doneChunk["style"] = "auto";
+        res.body += "data: " + doneChunk.dump() + "\n\n";
+
+        std::cout << "[PARSE-STREAM] \"" << text.substr(0, 40) << "\" -> "
+                  << prompt.substr(0, 60) << "..." << std::endl;
+    });
+
+    // ---- POST /api/generate (DashScope wanx-v1 异步模式) --------------------
     svr.Post("/api/generate", [](const httplib::Request& req, httplib::Response& res) {
         json reqBody;
         try { reqBody = json::parse(req.body); } catch (...) {
@@ -254,7 +316,7 @@ int main() {
             return;
         }
 
-        // wanx-v1 同步 API（去掉 X-DashScope-Async，一次请求直接返回结果）
+        // ---- 第1步: 异步提交任务 ----
         json dashBody;
         dashBody["model"] = "wanx-v1";
         dashBody["input"]["prompt"] = prompt;
@@ -265,56 +327,113 @@ int main() {
         dashBody["parameters"]["n"] = 1;
 
         httplib::Client dashCli("https://dashscope.aliyuncs.com");
-        dashCli.set_read_timeout(120);
+        dashCli.set_read_timeout(30);
 
-        httplib::Request syncReq;
-        syncReq.method = "POST";
-        syncReq.path = "/api/v1/services/aigc/text2image/image-synthesis";
-        syncReq.set_header("Content-Type", "application/json");
-        syncReq.set_header("Authorization", "Bearer " + g_dashscopeKey);
-        syncReq.body = dashBody.dump();
+        httplib::Request asyncReq;
+        asyncReq.method = "POST";
+        asyncReq.path = "/api/v1/services/aigc/text2image/image-synthesis";
+        asyncReq.set_header("Content-Type", "application/json");
+        asyncReq.set_header("Authorization", "Bearer " + g_dashscopeKey);
+        asyncReq.set_header("X-DashScope-Async", "enable");
+        asyncReq.body = dashBody.dump();
 
-        auto syncRes = dashCli.send(syncReq);
-
-        if (!syncRes) {
+        auto submitRes = dashCli.send(asyncReq);
+        if (!submitRes) {
             res.status = 502;
-            res.set_content("{\"error\":\"dashscope request failed\"}", "application/json");
-            std::cerr << "[GENERATE] sync: no response" << std::endl;
-            return;
-        }
-        json syncResp;
-        try { syncResp = json::parse(syncRes->body); } catch (...) {
-            res.status = 502;
-            res.set_content("{\"error\":\"invalid response\"}", "application/json");
-            std::cerr << "[GENERATE] sync parse: " << syncRes->body.substr(0, 300) << std::endl;
+            res.set_content("{\"error\":\"dashscope submit failed\"}", "application/json");
+            std::cerr << "[GENERATE] submit: no response" << std::endl;
             return;
         }
 
-        // 检查错误
-        if (syncResp.contains("code") && !syncResp["code"].is_null()) {
+        json submitResp;
+        try { submitResp = json::parse(submitRes->body); } catch (...) {
             res.status = 502;
-            json err;
-            err["error"] = syncResp.value("message", "");
-            err["raw"] = syncRes->body.substr(0, 300);
-            res.set_content(err.dump(), "application/json");
-            std::cerr << "[GENERATE] sync error: " << syncRes->body << std::endl;
+            res.set_content("{\"error\":\"invalid submit response\"}", "application/json");
+            std::cerr << "[GENERATE] submit parse: " << submitRes->body.substr(0, 300) << std::endl;
             return;
         }
 
-        // 同步返回：直接从 output.results 取 URL
+        // 检查提交错误
+        if (submitResp.contains("code") && !submitResp["code"].is_null()) {
+            std::string code = submitResp.value("code", "");
+            std::string msg = submitResp.value("message", "");
+            // code=200 表示异步提交成功
+            if (code != "200") {
+                res.status = 502;
+                json err;
+                err["error"] = msg;
+                err["raw"] = submitRes->body.substr(0, 300);
+                res.set_content(err.dump(), "application/json");
+                std::cerr << "[GENERATE] submit error: " << submitRes->body << std::endl;
+                return;
+            }
+        }
+
+        // 获取 task_id
+        std::string taskId;
+        if (submitResp.contains("output") && submitResp["output"].contains("task_id")) {
+            taskId = submitResp["output"]["task_id"].get<std::string>();
+        }
+        if (taskId.empty()) {
+            res.status = 502;
+            res.set_content("{\"error\":\"no task_id in response\"}", "application/json");
+            std::cerr << "[GENERATE] no task_id: " << submitRes->body.substr(0, 300) << std::endl;
+            return;
+        }
+        std::cout << "[GENERATE] task submitted: " << taskId << std::endl;
+
+        // ---- 第2步: 轮询任务状态 ----
         std::string imageUrl;
-        if (syncResp.contains("output") && syncResp["output"].contains("results")) {
-            imageUrl = syncResp["output"]["results"][0].value("url", "");
+        int maxPoll = 120;  // 最多轮询 120 次 (约 120s)
+        for (int i = 0; i < maxPoll; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            std::string pollPath = "/api/v1/tasks/" + taskId;
+            httplib::Request pollReq;
+            pollReq.method = "GET";
+            pollReq.path = pollPath;
+            pollReq.set_header("Authorization", "Bearer " + g_dashscopeKey);
+
+            auto pollRes = dashCli.send(pollReq);
+            if (!pollRes || pollRes->status != 200) {
+                std::cerr << "[GENERATE] poll failed, retry " << (i+1) << std::endl;
+                continue;
+            }
+
+            json pollResp;
+            try { pollResp = json::parse(pollRes->body); } catch (...) {
+                continue;
+            }
+
+            std::string taskStatus = pollResp.value("output", json::object()).value("task_status", "");
+            std::cout << "[GENERATE] poll " << (i+1) << ": status=" << taskStatus << std::endl;
+
+            if (taskStatus == "SUCCEEDED") {
+                // 提取图片 URL
+                if (pollResp["output"].contains("results")) {
+                    imageUrl = pollResp["output"]["results"][0].value("url", "");
+                }
+                break;
+            } else if (taskStatus == "FAILED") {
+                std::string errMsg = pollResp.value("output", json::object()).value("message", "task failed");
+                res.status = 502;
+                json err;
+                err["error"] = errMsg;
+                res.set_content(err.dump(), "application/json");
+                std::cerr << "[GENERATE] task failed: " << pollRes->body.substr(0, 300) << std::endl;
+                return;
+            }
+            // PENDING / RUNNING → 继续轮询
         }
 
         if (imageUrl.empty()) {
             res.status = 502;
-            res.set_content("{\"error\":\"no image url in response\"}", "application/json");
-            std::cerr << "[GENERATE] no url: " << syncRes->body.substr(0, 300) << std::endl;
+            res.set_content("{\"error\":\"image generation timeout\"}", "application/json");
+            std::cerr << "[GENERATE] timeout after polling" << std::endl;
             return;
         }
 
-        // 下载图片到本地
+        // ---- 第3步: 下载图片到本地 ----
         std::string host, dlPath;
         auto slashSlash = imageUrl.find("//");
         if (slashSlash != std::string::npos) {
@@ -357,9 +476,11 @@ int main() {
         if (endFlag) {
             // 结束请求: 发送讯飞 end frame，返回最终文字
             std::string finalText = sess.text;
-            if (sess.reco && sess.connected && !sess.ended) {
+            if (sess.reco && sess.reco->isConnected() && !sess.ended) {
                 sess.reco->sendEnd();
                 sess.ended = true;
+                // sendEnd 会等待最终结果，更新 sess.text
+                finalText = sess.text;
             }
             json out;
             out["text"] = finalText;
@@ -374,20 +495,41 @@ int main() {
         }
 
         // 新会话: 建立讯飞连接
-        if (!sess.connected && g_xfyunCfg.isValid()) {
+        if (!sess.initialized && g_xfyunCfg.isValid()) {
             sess.reco = std::make_unique<SpeechRecognizer>(g_xfyunCfg);
             sess.reco->setOnText([&sess](const std::string& t, bool final, double conf) {
                 sess.text += t;
             });
-            sess.connected = sess.reco->connect();
+            sess.initialized = true;
+            if (!sess.reco->connect()) {
+                std::cerr << "[SPEECH] 讯飞连接失败, session=" << sid << std::endl;
+                sess.reco.reset();
+                sess.initialized = false;
+            }
         }
 
         // 发送音频（raw PCM binary body）
-        if (sess.reco && sess.connected && !sess.ended) {
+        if (sess.reco && sess.reco->isConnected() && !sess.ended) {
             std::vector<uint8_t> pcm(req.body.begin(), req.body.end());
             if (!pcm.empty()) {
                 sess.reco->sendAudio(pcm);
             }
+        }
+
+        // 检测讯飞连接是否已断开（VAD 静音自动关闭 / 错误断连）
+        // 使用 reco->isConnected() 而非缓存的 connected 标志
+        if (sess.reco && !sess.reco->isConnected() && !sess.text.empty()) {
+            std::string finalText = sess.text;
+            if (sess.reco) sess.reco->disconnect();
+            g_sessions.erase(sid);
+
+            json out;
+            out["text"] = finalText;
+            out["isFinal"] = true;
+            out["confidence"] = 0.9;
+            res.set_content(out.dump(), "application/json");
+            std::cout << "[SPEECH] VAD auto-end session " << sid << ". final: " << finalText << std::endl;
+            return;
         }
 
         json out;
@@ -405,7 +547,7 @@ int main() {
         json out;
         if (it != g_sessions.end()) {
             auto& sess = it->second;
-            if (sess.reco && sess.connected && !sess.ended) {
+            if (sess.reco && sess.reco->isConnected() && !sess.ended) {
                 sess.reco->sendEnd();
                 sess.ended = true;
             }

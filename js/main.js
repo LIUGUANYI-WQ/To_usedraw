@@ -41,6 +41,9 @@
   /** 累计识别文本 */
   let accumulatedText = '';
 
+  /** 是否已处理过最终结果（防止 VAD 自动结束 + 手动停止重复触发） */
+  let finalProcessed = false;
+
   function initCanvas() {
     if (!canvas) {
       console.error('Canvas 元素未找到');
@@ -131,11 +134,18 @@
     const confidence = data.confidence;
 
     if (isFinal) {
+      // 防止重复处理最终结果
+      if (finalProcessed) return;
+      finalProcessed = true;
+
       // 最终结果：追加到累计文本
       accumulatedText += text;
       showFinal(accumulatedText, confidence);
       processFinalText(accumulatedText, confidence);
       accumulatedText = '';  // 重置
+
+      // VAD 自动结束或手动停止，停止录音避免继续发空音频
+      if (isListening) stopListening();
     } else {
       // 中间结果：显示当前片段
       showInterim(accumulatedText + text);
@@ -233,6 +243,7 @@
       onStart: () => {
         isListening = true;
         accumulatedText = '';
+        finalProcessed = false;
         setListeningState(true);
         hideError();
       },
