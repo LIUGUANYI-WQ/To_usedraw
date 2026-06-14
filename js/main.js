@@ -180,7 +180,7 @@
         statusText.textContent = 'AI 生成图片中...';
         canvasPlaceholder.textContent = '生成中...';
 
-        return llmSvc.generate(parseResult.englishPrompt).then(genResult => {
+        return llmSvc.generate(parseResult.englishPrompt, parseResult.negativePrompt || '').then(genResult => {
           clearInterval(timerId);
           if (overlay) overlay.style.display = 'none';
           hideLLMThinking();

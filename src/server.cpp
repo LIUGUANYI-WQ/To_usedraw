@@ -8,7 +8,9 @@
  * 依赖: cpp-httplib + nlohmann/json + OpenSSL（libssl-dev）
  */
 
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 #include "speech_recognizer.h"
@@ -176,8 +178,8 @@ int main() {
         }
 
         SparkClient spark(g_sparkApiPassword);
-        std::string prompt;
-        if (!spark.optimizePrompt(text, prompt)) {
+        std::string prompt, negativePrompt;
+        if (!spark.optimizePrompt(text, prompt, negativePrompt)) {
             res.status = 502;
             res.set_content("{\"error\":\"Spark API failed\"}", "application/json");
             return;
@@ -186,6 +188,7 @@ int main() {
         json out;
         out["correctedText"] = text;
         out["englishPrompt"] = prompt;
+        out["negativePrompt"] = negativePrompt;
         out["style"] = "auto";
         out["analysis"] = "";
         res.set_content(out.dump(), "application/json");
@@ -216,8 +219,8 @@ int main() {
         }
 
         SparkClient spark(g_sparkApiPassword);
-        std::string prompt;
-        if (!spark.optimizePrompt(text, prompt)) {
+        std::string prompt, negativePrompt;
+        if (!spark.optimizePrompt(text, prompt, negativePrompt)) {
             res.status = 502;
             res.set_content("{\"error\":\"Spark API failed\"}", "application/json");
             return;
@@ -225,6 +228,7 @@ int main() {
 
         json out;
         out["englishPrompt"] = prompt;
+        out["negativePrompt"] = negativePrompt;
         out["rawText"] = text;
         res.set_content(out.dump(), "application/json");
     });
@@ -238,6 +242,7 @@ int main() {
             return;
         }
         std::string prompt = reqBody.value("prompt", "");
+        std::string negativePrompt = reqBody.value("negativePrompt", "");
         if (prompt.empty()) {
             res.status = 400;
             res.set_content("{\"error\":\"missing prompt\"}", "application/json");
@@ -253,6 +258,9 @@ int main() {
         json dashBody;
         dashBody["model"] = "wanx-v1";
         dashBody["input"]["prompt"] = prompt;
+        if (!negativePrompt.empty()) {
+            dashBody["input"]["negative_prompt"] = negativePrompt;
+        }
         dashBody["parameters"]["size"] = "1024*1024";
         dashBody["parameters"]["n"] = 1;
 

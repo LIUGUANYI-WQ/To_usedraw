@@ -27,11 +27,14 @@ public:
     /**
      * 调用星火 Lite，将口语文本优化为绘图提示词
      *
-     * @param rawText    讯飞语音转写得到的原始文本
-     * @param outPrompt  [out] 优化后的英文提示词
+     * @param rawText           讯飞语音转写得到的原始文本
+     * @param outPrompt         [out] 优化后的英文提示词
+     * @param outNegativePrompt [out] 负面提示词（避免画面出现的元素）
      * @return true=成功, false=失败
      */
-    bool optimizePrompt(const std::string& rawText, std::string& outPrompt);
+    bool optimizePrompt(const std::string& rawText,
+                        std::string& outPrompt,
+                        std::string& outNegativePrompt);
 
 private:
     /** libcurl 写回调 */
