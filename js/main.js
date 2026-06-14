@@ -477,11 +477,43 @@
   });
 
   // ===========================
+  // 用户认证
+  // ===========================
+
+  function initAuth() {
+    const userInfoEl = document.getElementById('userInfo');
+    const userAvatarEl = document.getElementById('userAvatar');
+    const userNameEl = document.getElementById('userName');
+    const logoutBtn = document.getElementById('logoutBtn');
+
+    if (!window.auth) return;
+
+    auth.requireAuth().then(user => {
+      if (!user) return;  // requireAuth 会自动跳转
+      // 显示用户信息
+      userInfoEl.style.display = 'flex';
+      const displayName = user.nickname || user.username;
+      userNameEl.textContent = displayName;
+      userAvatarEl.textContent = displayName.charAt(0).toUpperCase();
+    });
+
+    if (logoutBtn) {
+      logoutBtn.addEventListener('click', async function () {
+        await auth.logout();
+        window.location.href = '/login.html';
+      });
+    }
+  }
+
+  // ===========================
   // 启动
   // ===========================
   function bootstrap() {
     console.log('语音绘图工具 — 启动（讯飞模式）');
     console.log('AudioCapture:', AudioCapture.isSupported() ? '支持' : '不支持');
+
+    // 先检查登录
+    initAuth();
 
     if (!checkAudioSupport()) return;
 

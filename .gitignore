@@ -1,6 +1,9 @@
 # API Key — 绝对不能提交
 .env
 
+# 用户数据
+users.json
+
 # 第三方库源码
 ixwebsocket_src/
 
