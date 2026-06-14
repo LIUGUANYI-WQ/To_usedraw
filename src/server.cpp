@@ -249,94 +249,78 @@ int main() {
             return;
         }
 
-        // wanx-v1 异步 API（httplib + OpenSSL 直连，零 system()）
+        // wanx-v1 同步 API（去掉 X-DashScope-Async，一次请求直接返回结果）
         json dashBody;
         dashBody["model"] = "wanx-v1";
         dashBody["input"]["prompt"] = prompt;
+        if (!negativePrompt.empty()) {
+            dashBody["input"]["negative_prompt"] = negativePrompt;
+        }
         dashBody["parameters"]["size"] = "1024*1024";
         dashBody["parameters"]["n"] = 1;
 
-        // 1. 提交任务
         httplib::Client dashCli("https://dashscope.aliyuncs.com");
-        dashCli.set_read_timeout(30);
+        dashCli.set_read_timeout(120);
 
-        // 手动构造 Request，完全控制所有 header（DashScope 对 Accept 敏感）
-        httplib::Request subReq;
-        subReq.method = "POST";
-        subReq.path = "/api/v1/services/aigc/text2image/image-synthesis";
-        subReq.set_header("Content-Type", "application/json");
-        subReq.set_header("X-DashScope-Async", "enable");
-        subReq.set_header("Authorization", "Bearer " + g_dashscopeKey);
-        subReq.body = dashBody.dump();
+        httplib::Request syncReq;
+        syncReq.method = "POST";
+        syncReq.path = "/api/v1/services/aigc/text2image/image-synthesis";
+        syncReq.set_header("Content-Type", "application/json");
+        syncReq.set_header("Authorization", "Bearer " + g_dashscopeKey);
+        syncReq.body = dashBody.dump();
 
-        auto submitRes = dashCli.send(subReq);
+        auto syncRes = dashCli.send(syncReq);
 
-        if (!submitRes) {
+        if (!syncRes) {
             res.status = 502;
-            res.set_content("{\"error\":\"dashscope submit failed\"}", "application/json");
-            std::cerr << "[GENERATE] submit: no response" << std::endl;
+            res.set_content("{\"error\":\"dashscope request failed\"}", "application/json");
+            std::cerr << "[GENERATE] sync: no response" << std::endl;
             return;
         }
-        json submitResp;
-        try { submitResp = json::parse(submitRes->body); } catch (...) {
+        json syncResp;
+        try { syncResp = json::parse(syncRes->body); } catch (...) {
             res.status = 502;
-            res.set_content("{\"error\":\"invalid submit response\"}", "application/json");
-            std::cerr << "[GENERATE] submit parse: " << submitRes->body.substr(0, 300) << std::endl;
+            res.set_content("{\"error\":\"invalid response\"}", "application/json");
+            std::cerr << "[GENERATE] sync parse: " << syncRes->body.substr(0, 300) << std::endl;
             return;
         }
-        if (submitResp.contains("code") && !submitResp["code"].is_null()) {
+
+        // 检查错误
+        if (syncResp.contains("code") && !syncResp["code"].is_null()) {
             res.status = 502;
             json err;
-            err["error"] = submitResp.value("message", "");
-            err["raw"] = submitRes->body.substr(0, 300);
+            err["error"] = syncResp.value("message", "");
+            err["raw"] = syncRes->body.substr(0, 300);
             res.set_content(err.dump(), "application/json");
-            std::cerr << "[GENERATE] submit error: " << submitRes->body << std::endl;
+            std::cerr << "[GENERATE] sync error: " << syncRes->body << std::endl;
             return;
         }
 
-        std::string taskId = submitResp["output"]["task_id"];
-        std::cout << "[GENERATE] task: " << taskId << std::endl;
-
-        // 2. 轮询
+        // 同步返回：直接从 output.results 取 URL
         std::string imageUrl;
-        for (int i = 0; i < 20; i++) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            auto pollRes = dashCli.Get(
-                ("/api/v1/tasks/" + taskId).c_str(),
-                {{"Authorization", "Bearer " + g_dashscopeKey}});
-
-            if (!pollRes) continue;
-            json pResp;
-            try { pResp = json::parse(pollRes->body); } catch (...) { continue; }
-            std::string status = pResp["output"].value("task_status", "");
-            if (status == "SUCCEEDED") {
-                imageUrl = pResp["output"]["results"][0].value("url", "");
-                break;
-            } else if (status == "FAILED") {
-                res.status = 502;
-                res.set_content("{\"error\":\"generation failed\"}", "application/json");
-                return;
-            }
+        if (syncResp.contains("output") && syncResp["output"].contains("results")) {
+            imageUrl = syncResp["output"]["results"][0].value("url", "");
         }
 
         if (imageUrl.empty()) {
             res.status = 502;
-            res.set_content("{\"error\":\"timeout\"}", "application/json");
+            res.set_content("{\"error\":\"no image url in response\"}", "application/json");
+            std::cerr << "[GENERATE] no url: " << syncRes->body.substr(0, 300) << std::endl;
             return;
         }
 
-        // 3. 下载图片
-        std::string host, path;
+        // 下载图片到本地
+        std::string host, dlPath;
         auto slashSlash = imageUrl.find("//");
         if (slashSlash != std::string::npos) {
             auto hostStart = slashSlash + 2;
             auto pathStart = imageUrl.find('/', hostStart);
             host = imageUrl.substr(hostStart, pathStart - hostStart);
-            path = imageUrl.substr(pathStart);
+            dlPath = imageUrl.substr(pathStart);
         }
         httplib::Client dlCli("https://" + host);
         dlCli.set_read_timeout(30);
-        auto dlRes = dlCli.Get(path.c_str());
+        auto dlRes = dlCli.Get(dlPath.c_str());
         if (!dlRes || dlRes->status != 200) {
             res.status = 502;
             res.set_content("{\"error\":\"image download failed\"}", "application/json");
