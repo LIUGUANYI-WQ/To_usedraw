@@ -39,14 +39,15 @@ add_subdirectory(ixwebsocket_src)
 # 可执行文件
 # ============================================================
 add_executable(server
-    server.cpp
-    speech_recognizer.h
-    speech_recognizer.cpp
-    spark_client.h
-    spark_client.cpp
+    src/server.cpp
+    src/speech_recognizer.cpp
+    src/spark_client.cpp
 )
 
-target_include_directories(server PRIVATE ${CMAKE_SOURCE_DIR}/ixwebsocket_src/ixwebsocket)
+target_include_directories(server PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/ixwebsocket_src/ixwebsocket
+)
 
 target_link_libraries(server PRIVATE
     httplib
