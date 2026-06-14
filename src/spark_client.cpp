@@ -17,6 +17,7 @@
 #include <curl/curl.h>
 #include <iostream>
 #include <cstring>
+#include <sstream>
 
 using json = nlohmann::json;
 
@@ -199,20 +200,184 @@ bool SparkClient::optimizePrompt(const std::string& rawText,
     }
 
     // ---- 解析内部 JSON ----
+    return parseContent(content, outPrompt, outNegativePrompt);
+}
+
+// ====================================================================
+// 流式 SSE 回调上下文
+// ====================================================================
+struct StreamCtx {
+    std::string accumulated;       // 累积的完整 content
+    std::function<void(const std::string&)> onChunk;  // 每次 delta 回调
+    bool hasError = false;
+    std::string errorMsg;
+};
+
+// ====================================================================
+// libcurl 流式写回调
+// ====================================================================
+size_t SparkClient::streamCallback(void* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* ctx = static_cast<StreamCtx*>(userdata);
+    std::string chunk(static_cast<char*>(ptr), size * nmemb);
+
+    // 解析 SSE 行：data: {...}\n\n
+    std::istringstream ss(chunk);
+    std::string line;
+    while (std::getline(ss, line)) {
+        // 去掉 \r
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        if (line.find("data:") != 0) continue;
+        std::string data = line.substr(5);
+        // 去前导空格
+        auto p = data.find_first_not_of(' ');
+        if (p != std::string::npos) data = data.substr(p);
+
+        if (data == "[DONE]") continue;
+
+        json j;
+        try { j = json::parse(data); } catch (...) { continue; }
+
+        // 检查错误
+        if (j.contains("code") && !j["code"].is_null()) {
+            int code = j["code"].get<int>();
+            if (code != 0) {
+                ctx->hasError = true;
+                ctx->errorMsg = j.value("message", "unknown error");
+                return size * nmemb;
+            }
+        }
+
+        // 提取 delta content
+        try {
+            std::string delta = j["choices"][0]["delta"]["content"].get<std::string>();
+            ctx->accumulated += delta;
+            if (ctx->onChunk) ctx->onChunk(delta);
+        } catch (...) {
+            // 有些 chunk 没有 delta.content，忽略
+        }
+    }
+    return size * nmemb;
+}
+
+// ====================================================================
+// 流式调用星火 Lite
+// ====================================================================
+bool SparkClient::optimizePromptStreaming(const std::string& rawText,
+                                          ChunkCallback onChunk,
+                                          std::string& outPrompt,
+                                          std::string& outNegativePrompt) {
+    if (m_apiPassword.empty()) {
+        std::cerr << "[SPARK] ERROR: API password not configured" << std::endl;
+        return false;
+    }
+    if (rawText.empty()) {
+        std::cerr << "[SPARK] ERROR: empty input text" << std::endl;
+        return false;
+    }
+
+    json body;
+    body["model"] = "lite";
+    body["messages"] = json::array({
+        {{"role", "system"}, {"content", SYSTEM_PROMPT}},
+        {{"role", "user"},   {"content", rawText}}
+    });
+    body["temperature"] = 0.3;
+    body["stream"] = true;
+
+    std::string bodyStr = body.dump();
+
+    StreamCtx ctx;
+    ctx.onChunk = onChunk;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "[SPARK] ERROR: curl_easy_init failed" << std::endl;
+        return false;
+    }
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    std::string authHeader = "Authorization: Bearer " + m_apiPassword;
+    headers = curl_slist_append(headers, authHeader.c_str());
+
+    curl_easy_setopt(curl, CURLOPT_URL, "https://spark-api-open.xf-yun.com/v1/chat/completions");
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, bodyStr.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(bodyStr.size()));
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streamCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        std::cerr << "[SPARK] ERROR: curl request failed: " << curl_easy_strerror(res) << std::endl;
+        return false;
+    }
+    if (httpCode != 200) {
+        std::cerr << "[SPARK] ERROR: HTTP " << httpCode << std::endl;
+        return false;
+    }
+    if (ctx.hasError) {
+        std::cerr << "[SPARK] ERROR: " << ctx.errorMsg << std::endl;
+        return false;
+    }
+
+    // 清理 markdown 并解析
+    std::string content = stripMarkdown(ctx.accumulated);
+    bool ok = parseContent(content, outPrompt, outNegativePrompt);
+
+    std::cout << "[SPARK-STREAM] \"" << rawText.substr(0, 40) << "\" -> "
+              << outPrompt.substr(0, 60) << "..." << std::endl;
+    return ok;
+}
+
+// ====================================================================
+// 工具：清理 markdown 包裹
+// ====================================================================
+std::string SparkClient::stripMarkdown(const std::string& raw) {
+    std::string content = raw;
+    auto p = content.find("```json");
+    if (p != std::string::npos) content = content.substr(p + 7);
+    else {
+        p = content.find("```");
+        if (p != std::string::npos) content = content.substr(p + 3);
+    }
+    p = content.rfind("```");
+    if (p != std::string::npos) content = content.substr(0, p);
+    auto a = content.find_first_not_of(" \t\n\r");
+    auto b = content.find_last_not_of(" \t\n\r");
+    if (a != std::string::npos) content = content.substr(a, b - a + 1);
+    return content;
+}
+
+// ====================================================================
+// 工具：解析内部 JSON
+// ====================================================================
+bool SparkClient::parseContent(const std::string& content,
+                                std::string& outPrompt,
+                                std::string& outNegativePrompt) {
     json parsed;
     try {
         parsed = json::parse(content);
     } catch (...) {
-        // LLM 输出不是合法 JSON，直接作为 prompt 使用
         std::cerr << "[SPARK] WARN: LLM output not valid JSON, using raw content" << std::endl;
         outPrompt = content;
+        outNegativePrompt = "blurry, low quality, deformed, ugly, text, watermark";
         return true;
     }
 
     outPrompt = parsed.value("englishPrompt", content);
     outNegativePrompt = parsed.value("negativePrompt", "blurry, low quality, deformed, ugly, text, watermark");
-
-    std::cout << "[SPARK] \"" << rawText.substr(0, 40) << "\" -> "
-              << outPrompt.substr(0, 60) << "..." << std::endl;
     return true;
 }

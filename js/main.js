@@ -150,11 +150,16 @@
       return;
     }
 
-    // 策略2: LLM 全链路 — parse → generate → 展示图片
+    // 策略2: LLM 全链路 — parse-stream → generate → 展示图片
     if (llmSvc) {
       showLLMThinking();
       statusText.textContent = 'AI 理解中...';
-      llmSvc.parse(text).then(parseResult => {
+      let streamText = '';
+      llmSvc.parseStream(text, (delta) => {
+        // 实时显示星火输出的增量文本
+        streamText += delta;
+        canvasPlaceholder.textContent = 'AI: ' + streamText;
+      }).then(parseResult => {
         if (!parseResult || !parseResult.englishPrompt) {
           hideLLMThinking();
           showUnrecognized(text);

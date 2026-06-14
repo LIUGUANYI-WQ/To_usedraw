@@ -233,6 +233,68 @@ int main() {
         res.set_content(out.dump(), "application/json");
     });
 
+    // ---- POST /api/parse-stream (星火 Lite 流式 SSE → 优化 Prompt) ------
+    svr.Post("/api/parse-stream", [](const httplib::Request& req, httplib::Response& res) {
+        json reqBody;
+        try { reqBody = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid JSON\"}", "application/json");
+            return;
+        }
+
+        std::string text = reqBody.value("text", "");
+        if (text.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing text\"}", "application/json");
+            return;
+        }
+
+        if (g_sparkApiPassword.empty()) {
+            res.status = 500;
+            res.set_content("{\"error\":\"SPARK_API_PASSWORD not set\"}", "application/json");
+            return;
+        }
+
+        // 设置 SSE 响应头
+        res.set_header("Content-Type", "text/event-stream");
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+
+        // 流式调用星火，每个 chunk 通过 SSE 推送给前端
+        SparkClient spark(g_sparkApiPassword);
+        std::string prompt, negativePrompt;
+
+        bool ok = spark.optimizePromptStreaming(text,
+            [&res](const std::string& delta) {
+                // SSE 格式: data: {...}\n\n
+                json chunk;
+                chunk["type"] = "delta";
+                chunk["text"] = delta;
+                res.body += "data: " + chunk.dump() + "\n\n";
+            },
+            prompt, negativePrompt);
+
+        if (!ok) {
+            json errChunk;
+            errChunk["type"] = "error";
+            errChunk["error"] = "Spark API failed";
+            res.body += "data: " + errChunk.dump() + "\n\n";
+            return;
+        }
+
+        // 最终结果
+        json doneChunk;
+        doneChunk["type"] = "done";
+        doneChunk["englishPrompt"] = prompt;
+        doneChunk["negativePrompt"] = negativePrompt;
+        doneChunk["correctedText"] = text;
+        doneChunk["style"] = "auto";
+        res.body += "data: " + doneChunk.dump() + "\n\n";
+
+        std::cout << "[PARSE-STREAM] \"" << text.substr(0, 40) << "\" -> "
+                  << prompt.substr(0, 60) << "..." << std::endl;
+    });
+
     // ---- POST /api/generate (DashScope Z-Image-Turbo) --------------------
     svr.Post("/api/generate", [](const httplib::Request& req, httplib::Response& res) {
         json reqBody;
